@@ -45,6 +45,8 @@ const queuedEditMessageText = (...args) => telegramSendQueue.add(() => bot.editM
 /**
  * Main polling function for the helper bot. Finds and processes new game sessions.
  */
+// REPLACEMENT for processInteractiveGames in helper_bot.js
+
 async function processInteractiveGames() {
     if (processInteractiveGames.isRunning) return;
     processInteractiveGames.isRunning = true;
@@ -58,17 +60,16 @@ async function processInteractiveGames() {
             console.log(`[Helper] Picked up session ${session.session_id} (Type: ${session.game_type})`);
             await client.query("UPDATE interactive_game_sessions SET status = 'in_progress', helper_bot_id = $1 WHERE session_id = $2", [MY_BOT_ID, session.session_id]);
             
-            // Route to the correct game handler
+            // *** THIS IS THE FIX: The cases now match the GAME_IDS from the Main Bot ***
             switch (session.game_type) {
-                case 'bowling_pinpoint':
+                case 'bowling': // Changed from 'bowling_pinpoint'
                     await runPinpointBowling(session);
                     break;
-                case '3pt_shootout':
+                case 'basketball': // Changed from '3pt_shootout'
                     await runThreePointShootout(session);
                     break;
                 default:
                     console.error(`[Helper] Unknown game type in session ${session.session_id}: ${session.game_type}`);
-                    // Mark as error and refund the bet amount so the main bot can process it
                     await client.query("UPDATE interactive_game_sessions SET status = 'archived_error', final_payout_lamports = $1 WHERE session_id = $2", [session.bet_amount_lamports, session.session_id]);
             }
         }
@@ -79,8 +80,6 @@ async function processInteractiveGames() {
         processInteractiveGames.isRunning = false;
     }
 }
-processInteractiveGames.isRunning = false;
-
 /**
  * Sends the initial message for a Pinpoint Bowling game.
  */
