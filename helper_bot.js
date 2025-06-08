@@ -1,5 +1,4 @@
 // helper_bot.js - FINAL STABLE VERSION
-// This bot's sole purpose is to handle API-intensive game animations and interactions.
 
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
@@ -9,9 +8,9 @@ import PQueue from 'p-queue';
 // --- Configuration ---
 const HELPER_BOT_TOKEN = process.env.HELPER_BOT_TOKEN;
 const DATABASE_URL = process.env.DATABASE_URL;
-const MY_BOT_ID = process.env.HELPER_BOT_ID || 'HelperBot_1'; // An identifier for this helper instance
-const GAME_LOOP_INTERVAL = 2500; // Poll for new games every 2.5 seconds
-const PLAYER_CHOICE_TIMEOUT = 60000; // 60 seconds for a player to make a move
+const MY_BOT_ID = process.env.HELPER_BOT_ID || 'HelperBot_1';
+const GAME_LOOP_INTERVAL = 2500;
+const PLAYER_CHOICE_TIMEOUT = 60000;
 
 // --- Basic Utilities ---
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -19,7 +18,7 @@ const escapeHTML = (text) => text ? String(text).replace(/&/g, '&amp;').replace(
 
 // --- Game Constants ---
 const THREE_POINT_PAYOUTS = [1.5, 2.2, 3.5, 5.0, 10.0, 20.0, 50.0];
-const BOWL_FOR_BUCKS_PAYOUTS = { 6: 3.2, 5: 1.8, 4: 0.5, 3: 0.2, 2: 0.1, 1: 0.0 };
+const PINPOINT_BOWLING_PAYOUT_MULTIPLIER = 5.5;
 const DARTS_FORTUNE_PAYOUTS = { 6: 3.5, 5: 1.5, 4: 0.5, 3: 0.2, 2: 0.1, 1: 0.0 };
 
 // --- Database & Bot Setup ---
@@ -42,9 +41,6 @@ const queuedSendMessage = (...args) => telegramSendQueue.add(() => bot.sendMessa
 // --- CORE HELPER BOT LOGIC ---
 // ===================================================================
 
-/**
- * Main polling function for the helper bot. Finds and processes new game sessions.
- */
 async function processInteractiveGames() {
     if (processInteractiveGames.isRunning) return;
     processInteractiveGames.isRunning = true;
@@ -60,10 +56,10 @@ async function processInteractiveGames() {
             
             switch (session.game_type) {
                 case 'bowling':
-                    await runInstantGame(session, '🎳', BOWL_FOR_BUCKS_PAYOUTS);
+                    await runPinpointBowling(session);
                     break;
                 case 'darts':
-                    await runInstantGame(session, '🎯', DARTS_FORTUNE_PAYOUTS);
+                    await runDartsFortune(session);
                     break;
                 case 'basketball':
                     await runThreePointShootout(session);
@@ -83,29 +79,49 @@ async function processInteractiveGames() {
 processInteractiveGames.isRunning = false;
 
 /**
- * Generic handler for simple, instant-win dice animation games like Bowling and Darts.
+ * Sends the initial choice buttons for the interactive Pinpoint Bowling game.
  */
-async function runInstantGame(session, emoji, payoutTable) {
-    try {
-        const diceMessage = await bot.sendDice(session.chat_id, { emoji });
-        
-        if (!diceMessage || !diceMessage.dice) {
-            throw new Error("Failed to send dice animation from Telegram API.");
+async function runPinpointBowling(session) {
+    const messageTextHTML = `🎳 <b>Pinpoint Bowling Challenge!</b> 🎳\n\n` +
+        `Our Game Bot is handling the action.\n\n` +
+        `<b>Predict the exact outcome of the roll!</b> Choose your target below. You have ${PLAYER_CHOICE_TIMEOUT / 1000} seconds.`;
+
+    const keyboard = {
+        inline_keyboard: [
+            [{ text: "Gutter (1)", callback_data: `h:bowling_choice:${session.main_bot_game_id}:1` }, { text: "Hit (2)", callback_data: `h:bowling_choice:${session.main_bot_game_id}:2` }, { text: "Hit (3)", callback_data: `h:bowling_choice:${session.main_bot_game_id}:3` }],
+            [{ text: "Hit (4)", callback_data: `h:bowling_choice:${session.main_bot_game_id}:4` }, { text: "Hit (5)", callback_data: `h:bowling_choice:${session.main_bot_game_id}:5` }, { text: "Strike! (6)", callback_data: `h:bowling_choice:${session.main_bot_game_id}:6` }]
+        ]
+    };
+    
+    const sentMsg = await queuedSendMessage(session.chat_id, messageTextHTML, { parse_mode: 'HTML', reply_markup: keyboard });
+    
+    setTimeout(async () => {
+        const res = await pool.query("UPDATE interactive_game_sessions SET status = 'completed_timeout' WHERE session_id = $1 AND status = 'in_progress' RETURNING session_id", [session.session_id]);
+        if (res.rowCount > 0 && sentMsg) {
+            console.log(`[Helper] Bowling session ${session.session_id} timed out.`);
+            await bot.deleteMessage(session.chat_id, sentMsg.message_id).catch(()=>{});
         }
+    }, PLAYER_CHOICE_TIMEOUT);
+}
+
+/**
+ * Handler for the instant-win Darts Fortune game.
+ */
+async function runDartsFortune(session) {
+    try {
+        const diceMessage = await bot.sendDice(session.chat_id, { emoji: '🎯' });
+        if (!diceMessage || !diceMessage.dice) throw new Error("Failed to send dice animation from Telegram API.");
         
         await sleep(4000); 
         await bot.deleteMessage(session.chat_id, diceMessage.message_id).catch(() => {});
         
         const rollValue = diceMessage.dice.value;
-        const multiplier = payoutTable[rollValue];
-        // The main bot calculates the final payout based on this multiplier.
-        // Here we store the full return amount.
+        const multiplier = DARTS_FORTUNE_PAYOUTS[rollValue];
         const finalPayout = (BigInt(session.bet_amount_lamports) * BigInt(Math.floor(multiplier * 100))) / 100n;
         
-        // The main bot's poller will see this 'completed_win' status and process the payout.
         await pool.query("UPDATE interactive_game_sessions SET status = 'completed_win', final_payout_lamports = $1 WHERE session_id = $2", [finalPayout.toString(), session.session_id]);
     } catch (e) {
-        console.error(`[Helper] Error running instant game ${session.game_type} for session ${session.session_id}: ${e.message}`);
+        console.error(`[Helper] Error running Darts Fortune game for session ${session.session_id}: ${e.message}`);
         await pool.query("UPDATE interactive_game_sessions SET status = 'archived_error' WHERE session_id = $1", [session.session_id]);
     }
 }
@@ -122,29 +138,23 @@ async function runThreePointShootout(session) {
  */
 async function processThreePointShot(sessionId) {
     const logPrefix = `[Helper_3PT GID:${sessionId}]`;
-    let gameData;
-    let processingMsg;
+    let gameData, processingMsg;
 
     try {
         const gameRes = await pool.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [sessionId]);
-        if (gameRes.rowCount === 0 || gameRes.rows[0].status !== 'in_progress') {
-            return;
-        }
+        if (gameRes.rowCount === 0 || gameRes.rows[0].status !== 'in_progress') return;
+        
         gameData = gameRes.rows[0];
         const gameState = gameData.game_state_json || {};
         
         processingMsg = await queuedSendMessage(gameData.chat_id, `🏀 Taking shot #${(gameState.successfulShots || 0) + 1}...`, { parse_mode: 'HTML' });
-        
         const diceMessage = await bot.sendDice(gameData.chat_id, { emoji: '🏀' });
 
-        // ** CRITICAL FIX **: Immediately check if the dice was sent before using it.
         if (!diceMessage || !diceMessage.dice) {
-            throw new Error("Failed to send dice animation, likely due to an API or network issue.");
+            throw new Error("Failed to send dice animation, likely due to API or network issue.");
         }
 
         await sleep(3000);
-
-        // Cleanup messages
         if (processingMsg) await bot.deleteMessage(gameData.chat_id, processingMsg.message_id).catch(() => {});
         await bot.deleteMessage(gameData.chat_id, diceMessage.message_id).catch(() => {});
 
@@ -186,7 +196,7 @@ bot.on('callback_query', async (callbackQuery) => {
     const data = callbackQuery.data;
     if (!data || !data.startsWith('h:')) return; 
 
-    const [prefix, action, gameId] = data.split(':');
+    const [prefix, action, gameId, choice] = data.split(':');
     
     const sessionRes = await pool.query("SELECT * FROM interactive_game_sessions WHERE main_bot_game_id = $1 AND status = 'in_progress'", [gameId]);
     if (sessionRes.rowCount === 0) return;
@@ -197,6 +207,24 @@ bot.on('callback_query', async (callbackQuery) => {
     await bot.deleteMessage(callbackQuery.message.chat.id, callbackQuery.message.message_id).catch(() => {});
 
     switch (action) {
+        case 'bowling_choice':
+            await queuedSendMessage(session.chat_id, `You bet on a <b>${choice === '6' ? 'Strike' : choice}</b>! Rolling...`, { parse_mode: 'HTML' });
+            const diceMessage = await bot.sendDice(session.chat_id, { emoji: '🎳' });
+            await sleep(4000);
+            
+            if (diceMessage) await bot.deleteMessage(session.chat_id, diceMessage.message_id).catch(()=>{});
+            
+            const rollValue = diceMessage ? diceMessage.dice.value : 1; // Default to loss if sendDice fails
+            const win = (String(choice) === String(rollValue));
+            
+            let payoutAmount = 0n;
+            if (win) {
+                payoutAmount = (BigInt(session.bet_amount_lamports) * BigInt(Math.floor(PINPOINT_BOWLING_PAYOUT_MULTIPLIER * 100))) / 100n;
+            }
+            
+            await pool.query("UPDATE interactive_game_sessions SET status = 'completed_win', final_payout_lamports = $1 WHERE session_id = $2", [payoutAmount.toString(), session.session_id]);
+            break;
+            
         case '3pt_shoot':
             await processThreePointShot(session.session_id);
             break;
@@ -204,14 +232,12 @@ bot.on('callback_query', async (callbackQuery) => {
         case '3pt_cashout':
             const gameState = session.game_state_json || {};
             const currentMultiplier = gameState.currentMultiplier || 0;
-            // Payout is the full return amount. Main bot will handle ledger.
             const finalPayout = (BigInt(session.bet_amount_lamports) * BigInt(Math.floor(currentMultiplier * 100))) / 100n;
             const finalStatus = currentMultiplier > 0 ? 'completed_cashout' : 'completed_loss';
             await pool.query("UPDATE interactive_game_sessions SET status = $1, final_payout_lamports = $2 WHERE session_id = $3", [finalStatus, finalPayout.toString(), session.session_id]);
             break;
     }
 });
-
 
 // --- Main Execution ---
 console.log('🚀 Helper Bot starting...');
