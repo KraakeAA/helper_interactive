@@ -605,7 +605,7 @@ bot.on('callback_query', async (callbackQuery) => {
         const [action, sessionId] = data.split(':');
         if (action === 'simple_hoops_cashout') {
             await handleSimpleHoopsCashoutHelper(sessionId);
-    
+        }
         return;
     }
     // --- END OF ADDED BLOCK ---
