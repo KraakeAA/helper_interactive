@@ -124,6 +124,8 @@ async function runSimpleHoopsGame(session) {
  * Creates and updates the single game message for Simple Hoops.
  * @param {number} sessionId The database ID of the session.
  */
+// in helper_bot.js - REPLACE this entire function
+
 async function updateSimpleHoopsMessageHelper(sessionId) {
     const logPrefix = `[UpdateSimpleHoopsMsg SID:${sessionId}]`;
     let client = null;
@@ -157,7 +159,8 @@ async function updateSimpleHoopsMessageHelper(sessionId) {
         bodyHTML += `Progress: ${progressIcons}\nRound: <b>${gameState.currentRound} / ${SIMPLE_HOOPS_ROUNDS}</b>\n\n`;
 
         if (gameState.status === 'awaiting_shot') {
-            promptHTML = `It's your turn! Send 🎲 to take your shot (${gameState.shotsTakenInRound + 1}/${SIMPLE_HOOPS_SHOTS_PER_ROUND}).`;
+            // --- THIS IS THE FIX: Changed 🎲 to 🏀 ---
+            promptHTML = `It's your turn! Send 🏀 to take your shot (${gameState.shotsTakenInRound + 1}/${SIMPLE_HOOPS_SHOTS_PER_ROUND}).`;
         } else if (gameState.status === 'round_failed_cashout_prompt') {
             const cashoutValue = BigInt(session.bet_amount_lamports) * BigInt(Math.floor(SIMPLE_HOOPS_CASHOUT_MULTIPLIER * 100)) / 100n;
             const cashoutDisplay = await formatBalanceForDisplay(cashoutValue, 'USD');
