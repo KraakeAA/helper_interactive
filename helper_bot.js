@@ -269,8 +269,10 @@ async function handleSimpleHoopsContinueHelper(sessionId) {
 // --- GAME ENGINE & STATE MACHINE ---
 // ===================================================================
 
+// in helper_bot.js - REPLACE the existing handleGameStart function
+
 async function handleGameStart(session) {
-    const logPrefix = `[HandleStart_V8 SID:${session.session_id}]`;
+    const logPrefix = `[HandleStart_V9_Fix SID:${session.session_id}]`;
     console.log(`${logPrefix} Initializing game: ${session.game_type}`);
     let client = null;
     try {
@@ -280,52 +282,54 @@ async function handleGameStart(session) {
             "UPDATE interactive_game_sessions SET status = 'in_progress', helper_bot_id = $1 WHERE session_id = $2 AND status = 'pending_pickup' RETURNING *",
             [MY_BOT_ID, session.session_id]
         );
-        if (updateRes.rowCount === 0) { await client.query('ROLLBACK'); return; }
-        
+
+        if (updateRes.rowCount === 0) {
+            await client.query('ROLLBACK');
+            console.log(`${logPrefix} Game already picked up by another process. Aborting.`);
+            return;
+        }
+        
         const liveSession = updateRes.rows[0];
         const gameState = liveSession.game_state_json || {};
         const gameType = liveSession.game_type;
-
-        // --- ADD THIS BLOCK ---
-        if (gameType === 'basketball') {
-            await runSimpleHoopsGame(liveSession);
-            await client.query('COMMIT'); // Commit the status change to in_progress
-            return; // Important to exit after starting the correct game
-        }
-        // --- END OF ADDED BLOCK ---
-        
-        const isPressYourLuck = ['bowling', 'darts'].includes(gameType) && !gameType.includes('_pvp'); // basketball removed
+        
+        // --- CORRECTED LOGIC: Initialize game state for all types FIRST ---
+        const isPressYourLuck = ['bowling', 'darts'].includes(gameType) && !gameType.includes('_pvp');
         const isNewPvPDuel = gameType.includes('_pvp');
-        
-        if (isPressYourLuck) {
-             gameState.turn = 1;
-             gameState.rolls = [];
-             gameState.currentMultiplier = 1.0;
+        
+        if (gameType === 'basketball') {
+            gameState.currentRound = 1;
+            gameState.shotsTakenInRound = 0;
+            gameState.status = 'awaiting_shot';
+        } else if (isPressYourLuck) {
+            gameState.turn = 1;
+            gameState.rolls = [];
+            gameState.currentMultiplier = 1.0;
         } else if (isNewPvPDuel) {
             gameState.p1Rolls = []; gameState.p1Score = 0;
             gameState.p2Rolls = []; gameState.p2Score = 0;
         }
-        
+        
         gameState.p1Name = gameState.initiatorName || "Player 1";
         gameState.currentPlayerTurn = String(gameState.initiatorId || liveSession.user_id);
         if (gameState.gameMode === 'pvp') gameState.p2Name = gameState.opponentName || "Player 2";
-        
+        
+        // Save the initialized state and COMMIT the transaction
         await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), liveSession.session_id]);
         await client.query('COMMIT');
 
-        if (isPressYourLuck) {
-            await updateKingpinChallengeState(liveSession.session_id);
-        } else if (isNewPvPDuel) {
-            await advancePvPGameState(liveSession.session_id);
-        } else {
-             console.warn(`${logPrefix} Unhandled game type for new engine: ${gameType}. Checking legacy games.`);
-             switch (gameType) {
-                case 'original_bowling': await runOriginalPinpointBowling(liveSession); break;
-                case 'original_darts': await runDartsFortune(liveSession); break;
-                case 'original_basketball': await runThreePointShootout(liveSession); break;
-                default: console.error(`${logPrefix} Unknown game type: ${gameType}`); await finalizeGame(liveSession, 'error');
-            }
-        }
+        // --- NOW, call the appropriate game loop AFTER committing ---
+        if (gameType === 'basketball') {
+            await runSimpleHoopsGame(liveSession);
+        } else if (isPressYourLuck) {
+            await updateKingpinChallengeState(liveSession.session_id);
+        } else if (isNewPvPDuel) {
+            await advancePvPGameState(liveSession.session_id);
+        } else {
+             // Handle legacy or unknown games
+             console.error(`${logPrefix} Unknown game type to start: ${gameType}`); 
+             await finalizeGame(liveSession, 'error');
+        }
     } catch (e) {
         if (client) await client.query('ROLLBACK');
         console.error(`${logPrefix} Error initializing game: ${e.message}`);
