@@ -250,13 +250,16 @@ async function finalizeGameSession(session, gameState) {
 // ===================================================================
 
 function getShotsPerPlayer(gameType) {
-    if (gameType.includes('bowling_duel')) return BOWLING_DUEL_FRAMES;
-    if (gameType.includes('basketball_clash')) return BASKETBALL_CLASH_SHOTS;
-    if (gameType.includes('darts_duel')) return DARTS_DUEL_THROWS;
-    // Original game fallbacks
-    if (gameType === 'basketball') return 3;
-    if (gameType === 'darts') return 1;
-    if (gameType === 'bowling') return 1;
+    // This now correctly covers both PvB ('bowling') and PvP ('bowling_duel_pvp')
+    if (gameType.includes('bowling')) return BOWLING_DUEL_FRAMES;
+    
+    // This covers both PvB ('basketball') and PvP ('basketball_clash_pvp')
+    if (gameType.includes('basketball')) return BASKETBALL_CLASH_SHOTS;
+
+    // This covers both PvB ('darts') and PvP ('darts_duel_pvp')
+    if (gameType.includes('darts')) return DARTS_DUEL_THROWS;
+    
+    // A safe default for any other game type
     return 1;
 }
 
