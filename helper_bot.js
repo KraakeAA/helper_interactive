@@ -480,51 +480,48 @@ async function promptPvPAction(session, gameState) {
 }
 
 async function handleRollSubmitted(session, lastRoll) {
-    const logPrefix = `[HandleRoll SID:${session.session_id}]`;
-    let client = null;
-    try {
-        // --- ADD THIS BLOCK ---
+    const logPrefix = `[HandleRoll SID:${session.session_id}]`;
+    // This function no longer needs its own DB connection, as the full session is passed in.
+    try {
+        if (session.status !== 'in_progress') {
+            console.warn(`${logPrefix} Roll received but game status is '${session.status}'. Ignoring.`);
+            return;
+        }
+
+        // --- Routing Logic ---
         if (session.game_type === 'basketball') {
             await handleSimpleHoopsRollHelper(session, lastRoll);
-            return; // Exit after handling
+            return; 
         }
-        // --- END OF ADDED BLOCK ---
+        
+        const gameState = session.game_state_json || {};
+        const currentPlayerId = gameState.currentPlayerTurn;
 
-        client = await pool.connect();
-        const res = await client.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1 FOR UPDATE", [session.session_id]);
-        if (res.rowCount === 0 || res.rows[0].status !== 'in_progress') return;
+        const timeoutId = activeTurnTimeouts.get(session.session_id);
+        if (timeoutId) {
+            clearTimeout(timeoutId);
+            activeTurnTimeouts.delete(session.session_id);
+        }
 
-        const liveSession = res.rows[0];
-        const gameState = liveSession.game_state_json || {};
-        const rollValue = lastRoll;
-        const currentPlayerId = gameState.currentPlayerTurn;
-
-        const timeoutId = activeTurnTimeouts.get(liveSession.session_id);
-        if (timeoutId) {
-            clearTimeout(timeoutId);
-            activeTurnTimeouts.delete(liveSession.session_id);
-        }
-
-        if (liveSession.game_type.includes('_pvp')) {
-            const playerKey = (String(gameState.initiatorId) === currentPlayerId) ? 'p1' : 'p2';
-            if (!gameState[`${playerKey}Rolls`]) gameState[`${playerKey}Rolls`] = [];
-            gameState[`${playerKey}Rolls`].push(rollValue);
-            await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), liveSession.session_id]);
-            await advancePvPGameState(liveSession.session_id);
-        } else {
-            gameState.rolls.push(rollValue);
-            gameState.lastRollValue = rollValue;
-            const effect = getPressYourLuckConfig(liveSession.game_type).effects[rollValue];
-            gameState.currentMultiplier = (gameState.currentMultiplier || 1.0) * effect.multiplier_increase;
-            gameState.turn++;
-            await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), liveSession.session_id]);
-            await updateKingpinChallengeState(liveSession.session_id);
-        }
-    } catch (e) {
-        console.error(`${logPrefix} Error handling submitted roll: ${e.message}`);
-    } finally {
-        if (client) client.release();
-    }
+        if (session.game_type.includes('_pvp')) {
+            const playerKey = (String(gameState.initiatorId) === currentPlayerId) ? 'p1' : 'p2';
+            if (!gameState[`${playerKey}Rolls`]) gameState[`${playerKey}Rolls`] = [];
+            gameState[`${playerKey}Rolls`].push(lastRoll);
+            await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
+            await advancePvPGameState(session.session_id);
+        } else { // For other PvB games like bowling/darts
+            if (!gameState.rolls) gameState.rolls = [];
+            gameState.rolls.push(lastRoll);
+            gameState.lastRollValue = lastRoll;
+            const effect = getPressYourLuckConfig(session.game_type).effects[lastRoll];
+            gameState.currentMultiplier = (gameState.currentMultiplier || 1.0) * effect.multiplier_increase;
+            gameState.turn++;
+            await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
+            await updateKingpinChallengeState(session.session_id);
+        }
+    } catch (e) {
+        console.error(`${logPrefix} Error handling submitted roll: ${e.message}`);
+    }
 }
 
 async function finalizeGame(session, finalStatus) {
@@ -643,16 +640,38 @@ async function handleNotification(msg) {
     try {
         const payload = JSON.parse(msg.payload);
         const session = payload.session || payload;
-        if (!session || !session.session_id) return;
+        if (!session) return;
+
+        // The session_id is the key piece of information in the payload
+        const sessionId = session.session_id || session.main_bot_game_id;
+        if (!sessionId) {
+            // In case the payload for roll submitted is just the session ID
+             if(msg.channel === 'interactive_roll_submitted' && typeof payload === 'number') {
+                 sessionId = payload;
+             } else if (msg.channel === 'interactive_roll_submitted' && payload.session_id) {
+                 sessionId = payload.session_id;
+             } else {
+                 return;
+             }
+        }
 
         if (msg.channel === 'game_session_pickup') {
             await handleGameStart(session);
         } else if (msg.channel === 'interactive_roll_submitted') {
-            const res = await pool.query("SELECT game_state_json FROM interactive_game_sessions WHERE session_id = $1", [session.session_id]);
-            if (res.rows.length > 0) {
-                 const { lastRoll } = res.rows[0].game_state_json;
-                 await handleRollSubmitted(session, lastRoll);
-            }
+            // --- THIS IS THE FIX ---
+            // Fetch the FULL session data from the DB using the ID from the notification
+            const res = await pool.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [sessionId]);
+            if (res.rows.length > 0) {
+                const fullSessionData = res.rows[0];
+                const lastRoll = fullSessionData.game_state_json?.lastRoll;
+                if (typeof lastRoll === 'number') {
+                    // Now pass the COMPLETE session object to the handler
+                    await handleRollSubmitted(fullSessionData, lastRoll);
+                } else {
+                    console.error(`[Helper] Roll notification received for SID:${sessionId}, but lastRoll not found in gameState.`);
+                }
+            }
+            // --- END OF FIX ---
         }
     } catch (e) { console.error('[Helper] Error processing notification payload:', e); }
 }
