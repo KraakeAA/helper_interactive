@@ -1,9 +1,11 @@
-// helper_bot.js - FINAL UNIFIED VERSION v5 - ALL INTERACTIVE GAMES
+// helper_bot.js - FINAL UNIFIED VERSION v6 - ALL-IN-ONE
 
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
 import { Pool } from 'pg';
 import PQueue from 'p-queue';
+import axios from 'axios';
+import { LAMPORTS_PER_SOL } from '@solana/web3.js';
 
 // --- Configuration ---
 const HELPER_BOT_TOKEN = process.env.HELPER_BOT_TOKEN;
@@ -12,14 +14,13 @@ const MY_BOT_ID = process.env.HELPER_BOT_ID || 'HelperBot_1';
 const GAME_LOOP_INTERVAL = 3000;
 const PLAYER_ACTION_TIMEOUT = 90000; // 90 seconds for a player to make a move
 
-// --- Basic Utilities ---
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+// --- Price Fetching & Formatting Dependencies ---
+const SOL_DECIMALS = 9;
+const solPriceCache = new Map();
+const SOL_PRICE_CACHE_KEY = 'sol_usd_price_cache';
+const SOL_USD_PRICE_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
 
-// ===================================================================
-// --- GAME CONSTANTS ---
-// ===================================================================
-
-// --- "Press Your Luck" PvB Games ---
+// --- Game Constants ---
 const BOWLING_FRAMES = 10;
 const KINGPIN_ROLL_EFFECTS = {
     6: { outcome: 'Strike 💎', multiplier_increase: 1.8 },
@@ -50,7 +51,6 @@ const DOWNTOWN_SHOOTOUT_EFFECTS = {
     1: { outcome: 'Airball! 💥', multiplier_increase: 0.0 }
 };
 
-// --- PvP Duel Games ---
 const PVP_BOWLING_FRAMES = 3;
 const PVP_BASKETBALL_SHOTS = 5;
 const PVP_DARTS_THROWS = 3;
@@ -65,16 +65,12 @@ const bot = new TelegramBot(HELPER_BOT_TOKEN, { polling: { params: { allowed_upd
 bot.on('polling_error', (error) => console.error(`[Helper] Polling Error: ${error.code} - ${error.message}`));
 const telegramSendQueue = new PQueue({ concurrency: 1, interval: 1000 / 20, intervalCap: 1 });
 const queuedSendMessage = (...args) => telegramSendQueue.add(() => bot.sendMessage(...args));
-
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // ===================================================================
 // --- GAME ENGINE & STATE MACHINE ---
 // ===================================================================
 
-/**
- * Main entry point called when a new game session is detected.
- * It identifies the game type and routes it to the correct logic.
- */
 async function handleGameStart(session) {
     const logPrefix = `[HandleStart_V5 SID:${session.session_id}]`;
     console.log(`${logPrefix} Initializing game: ${session.game_type}`);
@@ -83,21 +79,17 @@ async function handleGameStart(session) {
     try {
         client = await pool.connect();
         await client.query('BEGIN');
-
         const updateRes = await client.query(
             "UPDATE interactive_game_sessions SET status = 'in_progress', helper_bot_id = $1 WHERE session_id = $2 AND status = 'pending_pickup' RETURNING *",
             [MY_BOT_ID, session.session_id]
         );
-
         if (updateRes.rowCount === 0) {
-            console.log(`${logPrefix} Session was already claimed. Aborting.`);
             await client.query('ROLLBACK');
             return;
         }
         
         const liveSession = updateRes.rows[0];
         const gameState = liveSession.game_state_json || {};
-        
         const isPressYourLuck = ['bowling', 'darts', 'basketball'].includes(liveSession.game_type);
         
         if (isPressYourLuck) {
@@ -124,7 +116,6 @@ async function handleGameStart(session) {
         } else {
             await advancePvPGameState(liveSession.session_id);
         }
-
     } catch (e) {
         if (client) await client.query('ROLLBACK');
         console.error(`${logPrefix} Error initializing game: ${e.message}`);
@@ -133,9 +124,6 @@ async function handleGameStart(session) {
     }
 }
 
-/**
- * Handles all "Press Your Luck" style PvB games (Bowling, Darts, Basketball).
- */
 async function runPressYourLuckGame(sessionId) {
     const logPrefix = `[PressYourLuck SID:${sessionId}]`;
     let client = null;
@@ -147,22 +135,18 @@ async function runPressYourLuckGame(sessionId) {
         const session = res.rows[0];
         const gameState = session.game_state_json;
         const gameType = session.game_type;
-
         const { maxTurns, effects } = getPressYourLuckConfig(gameType);
         const lastRoll = gameState.lastRollValue;
 
-        if (lastRoll && effects[lastRoll].multiplier_increase === 0.0) {
-            await finalizeGame(session, 'completed_loss'); // Busted
+        if (lastRoll && effects[lastRoll]?.multiplier_increase === 0.0) {
+            await finalizeGame(session, 'completed_loss');
             return;
         }
-
         if (gameState.turn > maxTurns) {
-            await finalizeGame(session, 'completed_cashout'); // Auto-cashout after final frame
+            await finalizeGame(session, 'completed_cashout');
             return;
         }
-
         await promptPressYourLuckAction(session);
-
     } catch (e) {
         console.error(`${logPrefix} Error in game loop: ${e.message}`);
         await finalizeGame({session_id: sessionId}, 'error');
@@ -171,9 +155,6 @@ async function runPressYourLuckGame(sessionId) {
     }
 }
 
-/**
- * Sends the prompt message for "Press Your Luck" games.
- */
 async function promptPressYourLuckAction(session) {
     const gameState = session.game_state_json;
     const gameType = session.game_type;
@@ -197,14 +178,12 @@ async function promptPressYourLuckAction(session) {
     
     if (sentMsg) {
         gameState.lastMessageId = sentMsg.message_id;
+        if(gameState.turnTimeout) clearTimeout(gameState.turnTimeout);
         gameState.turnTimeout = setTimeout(() => finalizeGame(session, 'completed_timeout'), PLAYER_ACTION_TIMEOUT);
         await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
     }
 }
 
-/**
- * Main state machine for all turn-based PvP Duels.
- */
 async function advancePvPGameState(sessionId) {
     const logPrefix = `[AdvancePvP SID:${sessionId}]`;
     let client = null;
@@ -244,9 +223,6 @@ async function advancePvPGameState(sessionId) {
     }
 }
 
-/**
- * Sends the prompt message for PvP duel games.
- */
 async function promptPvPAction(session, gameState) {
     const { chat_id, game_type } = session;
     const { p1Name, p2Name, p1Rolls, p2Rolls, currentPlayerTurn, initiatorId } = gameState;
@@ -271,9 +247,6 @@ async function promptPvPAction(session, gameState) {
     await queuedSendMessage(chat_id, messageHTML, { parse_mode: 'HTML' });
 }
 
-/**
- * Simulates the bot's turn for PvB interactive games that are NOT press-your-luck.
- */
 async function runBotTurn(session, gameState) {
     await queuedSendMessage(session.chat_id, `🤖 The Bot Dealer is now taking its turn...`, { parse_mode: 'HTML' });
     await sleep(2000);
@@ -297,19 +270,16 @@ async function runBotTurn(session, gameState) {
     
     gameState.p2Rolls = botRolls;
     await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
-    await finalizeGame(session, 'pvp_resolve'); // Use pvp_resolve to trigger score comparison
+    await finalizeGame(session, 'pvp_resolve');
 }
 
-/**
- * Handles all incoming roll notifications from the main bot.
- */
 async function handleRollSubmitted(session) {
     const logPrefix = `[HandleRoll SID:${session.session_id}]`;
     let client = null;
     try {
         client = await pool.connect();
         const res = await client.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1 FOR UPDATE", [session.session_id]);
-        if (res.rowCount === 0 || !res.rows[0].status.startsWith('in_progress')) return;
+        if (res.rowCount === 0 || res.rows[0].status !== 'in_progress') return;
 
         const liveSession = res.rows[0];
         const gameState = liveSession.game_state_json || {};
@@ -340,10 +310,6 @@ async function handleRollSubmitted(session) {
     }
 }
 
-
-/**
- * Finalizes any game, calculates scores/payouts, and notifies the main bot.
- */
 async function finalizeGame(session, finalStatus) {
     const logPrefix = `[FinalizeGame SID:${session.session_id}]`;
     let client = null;
@@ -385,9 +351,6 @@ async function finalizeGame(session, finalStatus) {
         if(client) client.release();
     }
 }
-
-
-// --- Event Handlers & Main Loop ---
 
 bot.on('callback_query', async (callbackQuery) => {
     const data = callbackQuery.data;
@@ -459,7 +422,62 @@ async function processPendingGames() {
 processPendingGames.isRunning = false;
 
 
-// --- Utility Functions ---
+// --- UTILITY FUNCTIONS ---
+
+function stringifyWithBigInt(obj) {
+    return JSON.stringify(obj, (key, value) => (typeof value === 'bigint' ? value.toString() + 'n' : value), 2);
+}
+
+async function fetchSolUsdPriceFromBinanceAPI() {
+    try {
+        const response = await axios.get('https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT', { timeout: 8000 });
+        if (response.data?.price) return parseFloat(response.data.price);
+        throw new Error('Invalid price data from Binance API.');
+    } catch (error) { throw error; }
+}
+
+async function fetchSolUsdPriceFromCoinGeckoAPI() {
+    try {
+        const response = await axios.get('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd', { timeout: 8000 });
+        if (response.data?.solana?.usd) return parseFloat(response.data.solana.usd);
+        throw new Error('Invalid price data from CoinGecko API.');
+    } catch (error) { throw error; }
+}
+
+async function getSolUsdPrice() {
+    const cached = solPriceCache.get(SOL_PRICE_CACHE_KEY);
+    if (cached && (Date.now() - cached.timestamp < SOL_USD_PRICE_CACHE_TTL_MS)) return cached.price;
+    try {
+        const price = await fetchSolUsdPriceFromBinanceAPI();
+        solPriceCache.set(SOL_PRICE_CACHE_KEY, { price, timestamp: Date.now() });
+        return price;
+    } catch (e) {
+        try {
+            const price = await fetchSolUsdPriceFromCoinGeckoAPI();
+            solPriceCache.set(SOL_PRICE_CACHE_KEY, { price, timestamp: Date.now() });
+            return price;
+        } catch (e2) {
+            if (cached) return cached.price;
+            throw new Error("Could not retrieve SOL/USD price from any source.");
+        }
+    }
+}
+
+function convertLamportsToUSDString(lamports, solUsdPrice, d = 2) {
+    if (typeof solUsdPrice !== 'number' || solUsdPrice <= 0) return 'N/A';
+    const sol = Number(BigInt(lamports)) / Number(LAMPORTS_PER_SOL);
+    return `$${(sol * solUsdPrice).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d })}`;
+}
+
+async function formatBalanceForDisplay(lamports, currency = 'USD') {
+    if (currency === 'USD') {
+        try {
+            const price = await getSolUsdPrice();
+            return convertLamportsToUSDString(lamports, price);
+        } catch (e) { return 'N/A'; }
+    }
+    return `${(Number(BigInt(lamports)) / Number(LAMPORTS_PER_SOL)).toFixed(SOL_DECIMALS)} SOL`;
+}
 
 function getPressYourLuckConfig(gameType) {
     switch(gameType) {
@@ -486,13 +504,13 @@ function calculateFinalScore(gameType, rolls) {
 
 function getCleanGameNameHelper(gameType) {
     if (!gameType) return "Game";
-    const lowerCaseId = String(gameType).toLowerCase();
-    if (lowerCaseId.includes('bowling_duel_pvp')) return "Bowling Duel";
-    if (lowerCaseId.includes('darts_duel_pvp')) return "Darts Showdown";
-    if (lowerCaseId.includes('basketball_clash_pvp')) return "3-Point Clash";
-    if (lowerCaseId === 'bowling') return "Kingpin's Challenge";
-    if (lowerCaseId === 'darts') return "Bullseye Blitz";
-    if (lowerCaseId === 'basketball') return "Downtown Shootout";
+    const lt = String(gameType).toLowerCase();
+    if (lt.includes('bowling_duel_pvp')) return "Bowling Duel";
+    if (lt.includes('darts_duel_pvp')) return "Darts Showdown";
+    if (lt.includes('basketball_clash_pvp')) return "3-Point Clash";
+    if (lt === 'bowling') return "Kingpin's Challenge";
+    if (lt === 'darts') return "Bullseye Blitz";
+    if (lt === 'basketball') return "Downtown Shootout";
     return "Game";
 }
 
