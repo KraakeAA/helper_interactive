@@ -1,10 +1,9 @@
-// helper_bot.js - FINAL UNIFIED VERSION v6 - ALL-IN-ONE
+// helper_bot.js - FINAL UNIFIED VERSION v6 - All-in-One, No Omissions
 
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
 import { Pool } from 'pg';
-import cjsPQueue from 'p-queue';
-const PQueue = cjsPQueue.default ?? cjsPQueue;
+import PQueue from 'p-queue';
 import axios from 'axios';
 import { LAMPORTS_PER_SOL } from '@solana/web3.js';
 
@@ -13,13 +12,19 @@ const HELPER_BOT_TOKEN = process.env.HELPER_BOT_TOKEN;
 const DATABASE_URL = process.env.DATABASE_URL;
 const MY_BOT_ID = process.env.HELPER_BOT_ID || 'HelperBot_1';
 const GAME_LOOP_INTERVAL = 3000;
-const PLAYER_ACTION_TIMEOUT = 90000; // 90 seconds for a player to make a move
+const PLAYER_ACTION_TIMEOUT = 90000;
+
+// --- Basic Utilities ---
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // --- Price Fetching & Formatting Dependencies ---
 const SOL_DECIMALS = 9;
 const solPriceCache = new Map();
 const SOL_PRICE_CACHE_KEY = 'sol_usd_price_cache';
 const SOL_USD_PRICE_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+
+// --- THIS IS THE FIX: Store live timeouts in memory, not in the database ---
+const activeTurnTimeouts = new Map();
 
 // --- Game Constants ---
 const BOWLING_FRAMES = 10;
@@ -31,7 +36,6 @@ const KINGPIN_ROLL_EFFECTS = {
     2: { outcome: 'Gutter 🟡', multiplier_increase: 0.4 },
     1: { outcome: 'BUST 💥', multiplier_increase: 0.0 }
 };
-
 const DARTS_THROWS_TOTAL = 5;
 const BULLSEYE_BLITZ_EFFECTS = {
     6: { outcome: 'Bullseye! 🎯', multiplier_increase: 2.0 },
@@ -41,7 +45,6 @@ const BULLSEYE_BLITZ_EFFECTS = {
     2: { outcome: 'Outer Ring 🟡', multiplier_increase: 0.5 },
     1: { outcome: 'MISS! 💥', multiplier_increase: 0.0 }
 };
-
 const BASKETBALL_SHOTS_TOTAL = 5;
 const DOWNTOWN_SHOOTOUT_EFFECTS = {
     6: { outcome: 'Swish! 🎯', multiplier_increase: 1.9 },
@@ -51,7 +54,6 @@ const DOWNTOWN_SHOOTOUT_EFFECTS = {
     2: { outcome: 'Airball! 💥', multiplier_increase: 0.0 },
     1: { outcome: 'Airball! 💥', multiplier_increase: 0.0 }
 };
-
 const PVP_BOWLING_FRAMES = 3;
 const PVP_BASKETBALL_SHOTS = 5;
 const PVP_DARTS_THROWS = 3;
@@ -66,17 +68,16 @@ const bot = new TelegramBot(HELPER_BOT_TOKEN, { polling: { params: { allowed_upd
 bot.on('polling_error', (error) => console.error(`[Helper] Polling Error: ${error.code} - ${error.message}`));
 const telegramSendQueue = new PQueue({ concurrency: 1, interval: 1000 / 20, intervalCap: 1 });
 const queuedSendMessage = (...args) => telegramSendQueue.add(() => bot.sendMessage(...args));
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
 
 // ===================================================================
 // --- GAME ENGINE & STATE MACHINE ---
 // ===================================================================
 
 async function handleGameStart(session) {
-    const logPrefix = `[HandleStart_V5 SID:${session.session_id}]`;
+    const logPrefix = `[HandleStart_V6 SID:${session.session_id}]`;
     console.log(`${logPrefix} Initializing game: ${session.game_type}`);
     let client = null;
-
     try {
         client = await pool.connect();
         await client.query('BEGIN');
@@ -85,6 +86,7 @@ async function handleGameStart(session) {
             [MY_BOT_ID, session.session_id]
         );
         if (updateRes.rowCount === 0) {
+            console.log(`${logPrefix} Session was already claimed. Aborting.`);
             await client.query('ROLLBACK');
             return;
         }
@@ -97,11 +99,9 @@ async function handleGameStart(session) {
              gameState.turn = 1;
              gameState.rolls = [];
              gameState.currentMultiplier = 1.0;
-        } else { // PvP Duel
-            gameState.p1Rolls = [];
-            gameState.p1Score = 0;
-            gameState.p2Rolls = [];
-            gameState.p2Score = 0;
+        } else {
+            gameState.p1Rolls = []; gameState.p1Score = 0;
+            gameState.p2Rolls = []; gameState.p2Score = 0;
         }
         
         gameState.p1Name = gameState.initiatorName || "Player 1";
@@ -167,7 +167,6 @@ async function promptPressYourLuckAction(session) {
     const { maxTurns, emoji } = getPressYourLuckConfig(gameType);
     const currentPayout = BigInt(session.bet_amount_lamports) * BigInt(Math.floor(gameState.currentMultiplier * 100)) / 100n;
     const cashoutDisplay = await formatBalanceForDisplay(currentPayout, 'USD');
-
     const message = `${gameState.p1Name}, Turn ${gameState.turn}/${maxTurns}. Send ${emoji} to play.`;
     
     const keyboard = { inline_keyboard: [] };
@@ -179,9 +178,13 @@ async function promptPressYourLuckAction(session) {
     
     if (sentMsg) {
         gameState.lastMessageId = sentMsg.message_id;
-        if(gameState.turnTimeout) clearTimeout(gameState.turnTimeout);
-        gameState.turnTimeout = setTimeout(() => finalizeGame(session, 'completed_timeout'), PLAYER_ACTION_TIMEOUT);
         await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
+        
+        if (activeTurnTimeouts.has(session.session_id)) {
+            clearTimeout(activeTurnTimeouts.get(session.session_id));
+        }
+        const timeoutId = setTimeout(() => handleGameTimeout(session.session_id), PLAYER_ACTION_TIMEOUT);
+        activeTurnTimeouts.set(session.session_id, timeoutId);
     }
 }
 
@@ -215,7 +218,6 @@ async function advancePvPGameState(sessionId) {
         gameState.currentTurnStartTime = Date.now();
         await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), sessionId]);
         await promptPvPAction(session, gameState);
-
     } catch (e) {
         console.error(`${logPrefix} Error advancing PvP game state: ${e.message}`);
         await finalizeGame({session_id: sessionId}, 'error');
@@ -274,7 +276,7 @@ async function runBotTurn(session, gameState) {
     await finalizeGame(session, 'pvp_resolve');
 }
 
-async function handleRollSubmitted(session) {
+async function handleRollSubmitted(session, lastRoll) {
     const logPrefix = `[HandleRoll SID:${session.session_id}]`;
     let client = null;
     try {
@@ -284,18 +286,23 @@ async function handleRollSubmitted(session) {
 
         const liveSession = res.rows[0];
         const gameState = liveSession.game_state_json || {};
-        const rollValue = gameState.lastRoll;
+        const rollValue = lastRoll;
         const currentPlayerId = gameState.currentPlayerTurn;
 
-        if (liveSession.game_type.includes('_pvp')) { // It's a PvP Duel
+        const timeoutId = activeTurnTimeouts.get(liveSession.session_id);
+        if (timeoutId) {
+            clearTimeout(timeoutId);
+            activeTurnTimeouts.delete(liveSession.session_id);
+        }
+
+        if (liveSession.game_type.includes('_pvp')) {
             const playerKey = (String(gameState.initiatorId) === currentPlayerId) ? 'p1' : 'p2';
             if (!gameState[`${playerKey}Rolls`]) gameState[`${playerKey}Rolls`] = [];
             gameState[`${playerKey}Rolls`].push(rollValue);
             gameState.currentTurnStartTime = Date.now();
             await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), liveSession.session_id]);
             await advancePvPGameState(liveSession.session_id);
-        } else { // It's a "Press Your Luck" PvB game
-            if(gameState.turnTimeout) clearTimeout(gameState.turnTimeout);
+        } else {
             gameState.rolls.push(rollValue);
             gameState.lastRollValue = rollValue;
             const effect = getPressYourLuckConfig(liveSession.game_type).effects[rollValue];
@@ -313,17 +320,22 @@ async function handleRollSubmitted(session) {
 
 async function finalizeGame(session, finalStatus) {
     const logPrefix = `[FinalizeGame SID:${session.session_id}]`;
+    const timeoutId = activeTurnTimeouts.get(session.session_id);
+    if (timeoutId) {
+        clearTimeout(timeoutId);
+        activeTurnTimeouts.delete(session.session_id);
+    }
     let client = null;
     try {
         client = await pool.connect();
         await client.query('BEGIN');
-
         const liveSessionRes = await client.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1 FOR UPDATE", [session.session_id]);
         if(liveSessionRes.rowCount === 0) { await client.query('ROLLBACK'); return; }
+        
         const liveSession = liveSessionRes.rows[0];
         const gameState = liveSession.game_state_json;
-        
         let dbStatus = finalStatus;
+        let finalPayout = 0n;
         
         if (finalStatus === 'pvp_resolve') {
             const p1Score = calculateFinalScore(liveSession.game_type, gameState.p1Rolls);
@@ -333,11 +345,16 @@ async function finalizeGame(session, finalStatus) {
             if (p1Score > p2Score) dbStatus = 'completed_p1_win';
             else if (p2Score > p1Score) dbStatus = 'completed_p2_win';
             else dbStatus = 'completed_push';
+        } else if (finalStatus === 'completed_cashout') {
+            const multiplier = gameState.currentMultiplier || 0;
+            finalPayout = (BigInt(liveSession.bet_amount_lamports) * BigInt(Math.floor(multiplier * 100))) / 100n;
+        } else if (finalStatus === 'completed_loss' || finalStatus === 'completed_timeout' || finalStatus === 'error') {
+            finalPayout = 0n;
         }
 
         await client.query(
-            "UPDATE interactive_game_sessions SET status = $1, game_state_json = $2 WHERE session_id = $3",
-            [dbStatus, JSON.stringify(gameState), liveSession.session_id]
+            "UPDATE interactive_game_sessions SET status = $1, final_payout_lamports = $2, game_state_json = $3 WHERE session_id = $4",
+            [dbStatus, finalPayout.toString(), JSON.stringify(gameState), liveSession.session_id]
         );
         await client.query(`NOTIFY game_completed, '${JSON.stringify({ session_id: liveSession.session_id })}'`);
         await client.query('COMMIT');
@@ -356,7 +373,6 @@ async function finalizeGame(session, finalStatus) {
 bot.on('callback_query', async (callbackQuery) => {
     const data = callbackQuery.data;
     if (!data || !data.startsWith('interactive_cashout:')) return;
-
     await bot.answerCallbackQuery(callbackQuery.id, { text: "Cashing out..." }).catch(() => {});
     
     const sessionId = data.split(':')[1];
@@ -364,8 +380,11 @@ bot.on('callback_query', async (callbackQuery) => {
     if (sessionRes.rowCount > 0 && sessionRes.rows[0].status === 'in_progress') {
         const session = sessionRes.rows[0];
         if(String(session.user_id) !== String(callbackQuery.from.id)) return;
-        const gameState = session.game_state_json;
-        if(gameState.turnTimeout) clearTimeout(gameState.turnTimeout);
+        const timeoutId = activeTurnTimeouts.get(session.session_id);
+        if (timeoutId) {
+            clearTimeout(timeoutId);
+            activeTurnTimeouts.delete(session.session_id);
+        }
         await finalizeGame(session, 'completed_cashout');
     }
 });
@@ -387,7 +406,8 @@ async function handleNotification(msg) {
         if (msg.channel === 'game_session_pickup') {
             await handleGameStart(session);
         } else if (msg.channel === 'interactive_roll_submitted') {
-            await handleRollSubmitted(session);
+            const { lastRoll } = (await pool.query("SELECT game_state_json FROM interactive_game_sessions WHERE session_id = $1", [session.session_id])).rows[0].game_state_json;
+            await handleRollSubmitted(session, lastRoll);
         }
     } catch (e) { console.error('[Helper] Error processing notification payload:', e); }
 }
@@ -422,111 +442,20 @@ async function processPendingGames() {
 }
 processPendingGames.isRunning = false;
 
-
 // --- UTILITY FUNCTIONS ---
 
-function stringifyWithBigInt(obj) {
-    return JSON.stringify(obj, (key, value) => (typeof value === 'bigint' ? value.toString() + 'n' : value), 2);
-}
-
-async function fetchSolUsdPriceFromBinanceAPI() {
-    try {
-        const response = await axios.get('https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT', { timeout: 8000 });
-        if (response.data?.price) return parseFloat(response.data.price);
-        throw new Error('Invalid price data from Binance API.');
-    } catch (error) { throw error; }
-}
-
-async function fetchSolUsdPriceFromCoinGeckoAPI() {
-    try {
-        const response = await axios.get('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd', { timeout: 8000 });
-        if (response.data?.solana?.usd) return parseFloat(response.data.solana.usd);
-        throw new Error('Invalid price data from CoinGecko API.');
-    } catch (error) { throw error; }
-}
-
-async function getSolUsdPrice() {
-    const cached = solPriceCache.get(SOL_PRICE_CACHE_KEY);
-    if (cached && (Date.now() - cached.timestamp < SOL_USD_PRICE_CACHE_TTL_MS)) return cached.price;
-    try {
-        const price = await fetchSolUsdPriceFromBinanceAPI();
-        solPriceCache.set(SOL_PRICE_CACHE_KEY, { price, timestamp: Date.now() });
-        return price;
-    } catch (e) {
-        try {
-            const price = await fetchSolUsdPriceFromCoinGeckoAPI();
-            solPriceCache.set(SOL_PRICE_CACHE_KEY, { price, timestamp: Date.now() });
-            return price;
-        } catch (e2) {
-            if (cached) return cached.price;
-            throw new Error("Could not retrieve SOL/USD price from any source.");
-        }
-    }
-}
-
-function convertLamportsToUSDString(lamports, solUsdPrice, d = 2) {
-    if (typeof solUsdPrice !== 'number' || solUsdPrice <= 0) return 'N/A';
-    const sol = Number(BigInt(lamports)) / Number(LAMPORTS_PER_SOL);
-    return `$${(sol * solUsdPrice).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d })}`;
-}
-
-async function formatBalanceForDisplay(lamports, currency = 'USD') {
-    if (currency === 'USD') {
-        try {
-            const price = await getSolUsdPrice();
-            return convertLamportsToUSDString(lamports, price);
-        } catch (e) { return 'N/A'; }
-    }
-    return `${(Number(BigInt(lamports)) / Number(LAMPORTS_PER_SOL)).toFixed(SOL_DECIMALS)} SOL`;
-}
-
-function getPressYourLuckConfig(gameType) {
-    switch(gameType) {
-        case 'bowling': return { maxTurns: BOWLING_FRAMES, effects: KINGPIN_ROLL_EFFECTS, emoji: '🎳' };
-        case 'darts': return { maxTurns: DARTS_THROWS_TOTAL, effects: BULLSEYE_BLITZ_EFFECTS, emoji: '🎯' };
-        case 'basketball': return { maxTurns: BASKETBALL_SHOTS_TOTAL, effects: DOWNTOWN_SHOOTOUT_EFFECTS, emoji: '🏀' };
-        default: return { maxTurns: 1, effects: {}, emoji: '🎲' };
-    }
-}
-
-function getShotsPerPlayer(gameType) {
-    if (gameType.includes('bowling_duel_pvp')) return PVP_BOWLING_FRAMES;
-    if (gameType.includes('basketball_clash_pvp')) return PVP_BASKETBALL_SHOTS;
-    if (gameType.includes('darts_duel_pvp')) return PVP_DARTS_THROWS;
-    return 1;
-}
-
-function calculateFinalScore(gameType, rolls) {
-    const safeRolls = rolls || [];
-    if (safeRolls.length === 0) return 0;
-    if (gameType.includes('basketball')) return safeRolls.filter(r => r >= 4).length;
-    return safeRolls.reduce((a, b) => a + b, 0);
-}
-
-function getCleanGameNameHelper(gameType) {
-    if (!gameType) return "Game";
-    const lt = String(gameType).toLowerCase();
-    if (lt.includes('bowling_duel_pvp')) return "Bowling Duel";
-    if (lt.includes('darts_duel_pvp')) return "Darts Showdown";
-    if (lt.includes('basketball_clash_pvp')) return "3-Point Clash";
-    if (lt === 'bowling') return "Kingpin's Challenge";
-    if (lt === 'darts') return "Bullseye Blitz";
-    if (lt === 'basketball') return "Downtown Shootout";
-    return "Game";
-}
-
-function getGameEmoji(gameType) {
-    if (gameType.includes('bowling')) return '🎳';
-    if (gameType.includes('darts')) return '🎯';
-    if (gameType.includes('basketball')) return '🏀';
-    return '🎲';
-}
-
-function formatRollsHelper(rolls) {
-    if (!rolls || rolls.length === 0) return '...';
-    return rolls.map(r => `<b>${r}</b>`).join(' ');
-}
-
+function stringifyWithBigInt(obj) { return JSON.stringify(obj, (key, value) => (typeof value === 'bigint' ? value.toString() + 'n' : value), 2); }
+async function fetchSolUsdPriceFromBinanceAPI() { try { const response = await axios.get('https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT', { timeout: 8000 }); if (response.data?.price) return parseFloat(response.data.price); throw new Error('Invalid price data from Binance API.'); } catch (error) { throw error; }}
+async function fetchSolUsdPriceFromCoinGeckoAPI() { try { const response = await axios.get('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd', { timeout: 8000 }); if (response.data?.solana?.usd) return parseFloat(response.data.solana.usd); throw new Error('Invalid price data from CoinGecko API.'); } catch (error) { throw error; }}
+async function getSolUsdPrice() { const cached = solPriceCache.get(SOL_PRICE_CACHE_KEY); if (cached && (Date.now() - cached.timestamp < SOL_USD_PRICE_CACHE_TTL_MS)) return cached.price; try { const price = await fetchSolUsdPriceFromBinanceAPI(); solPriceCache.set(SOL_PRICE_CACHE_KEY, { price, timestamp: Date.now() }); return price; } catch (e) { try { const price = await fetchSolUsdPriceFromCoinGeckoAPI(); solPriceCache.set(SOL_PRICE_CACHE_KEY, { price, timestamp: Date.now() }); return price; } catch (e2) { if (cached) return cached.price; throw new Error("Could not retrieve SOL/USD price from any source."); } }}
+function convertLamportsToUSDString(lamports, solUsdPrice, d = 2) { if (typeof solUsdPrice !== 'number' || solUsdPrice <= 0) return 'N/A'; const sol = Number(BigInt(lamports)) / Number(LAMPORTS_PER_SOL); return `$${(sol * solUsdPrice).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d })}`;}
+async function formatBalanceForDisplay(lamports, currency = 'USD') { if (currency === 'USD') { try { const price = await getSolUsdPrice(); return convertLamportsToUSDString(lamports, price); } catch (e) { return 'N/A'; } } return `${(Number(BigInt(lamports)) / Number(LAMPORTS_PER_SOL)).toFixed(SOL_DECIMALS)} SOL`;}
+function getPressYourLuckConfig(gameType) { switch(gameType) { case 'bowling': return { maxTurns: BOWLING_FRAMES, effects: KINGPIN_ROLL_EFFECTS, emoji: '🎳' }; case 'darts': return { maxTurns: DARTS_THROWS_TOTAL, effects: BULLSEYE_BLITZ_EFFECTS, emoji: '🎯' }; case 'basketball': return { maxTurns: BASKETBALL_SHOTS_TOTAL, effects: DOWNTOWN_SHOOTOUT_EFFECTS, emoji: '🏀' }; default: return { maxTurns: 1, effects: {}, emoji: '🎲' }; }}
+function getShotsPerPlayer(gameType) { if (gameType.includes('bowling_duel_pvp')) return PVP_BOWLING_FRAMES; if (gameType.includes('basketball_clash_pvp')) return PVP_BASKETBALL_SHOTS; if (gameType.includes('darts_duel_pvp')) return PVP_DARTS_THROWS; return 1; }
+function calculateFinalScore(gameType, rolls) { const safeRolls = rolls || []; if (safeRolls.length === 0) return 0; if (gameType.includes('basketball')) return safeRolls.filter(r => r >= 4).length; return safeRolls.reduce((a, b) => a + b, 0); }
+function getCleanGameNameHelper(gameType) { if (!gameType) return "Game"; const lt = String(gameType).toLowerCase(); if (lt.includes('bowling_duel_pvp')) return "Bowling Duel"; if (lt.includes('darts_duel_pvp')) return "Darts Showdown"; if (lt.includes('basketball_clash_pvp')) return "3-Point Clash"; if (lt === 'bowling') return "Kingpin's Challenge"; if (lt === 'darts') return "Bullseye Blitz"; if (lt === 'basketball') return "Downtown Shootout"; return "Game"; }
+function getGameEmoji(gameType) { if (gameType.includes('bowling')) return '🎳'; if (gameType.includes('darts')) return '🎯'; if (gameType.includes('basketball')) return '🏀'; return '🎲'; }
+function formatRollsHelper(rolls) { if (!rolls || rolls.length === 0) return '...'; return rolls.map(r => `<b>${r}</b>`).join(' '); }
 
 // --- Main Execution ---
 console.log('🚀 Helper Bot starting...');
