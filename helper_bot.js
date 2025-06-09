@@ -1,11 +1,11 @@
-// helper_bot.js - FINAL UNIFIED VERSION v6 - All-in-One, No Omissions
+// helper_bot.js - FINAL UNIFIED VERSION v7 - Corrects PQueue import error.
 
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
 import { Pool } from 'pg';
-import PQueue from 'p-queue';
 import axios from 'axios';
 import { LAMPORTS_PER_SOL } from '@solana/web3.js';
+import cjsPQueue from 'p-queue';
 
 // --- Configuration ---
 const HELPER_BOT_TOKEN = process.env.HELPER_BOT_TOKEN;
@@ -21,9 +21,9 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const SOL_DECIMALS = 9;
 const solPriceCache = new Map();
 const SOL_PRICE_CACHE_KEY = 'sol_usd_price_cache';
-const SOL_USD_PRICE_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+const SOL_USD_PRICE_CACHE_TTL_MS = 60 * 60 * 1000;
 
-// --- THIS IS THE FIX: Store live timeouts in memory, not in the database ---
+// --- In-Memory State ---
 const activeTurnTimeouts = new Map();
 
 // --- Game Constants ---
@@ -64,14 +64,16 @@ if (!HELPER_BOT_TOKEN || !DATABASE_URL) {
     process.exit(1);
 }
 const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
+
+// --- THIS IS THE CORRECTED PQUEUE INITIALIZATION ---
+const PQueue = cjsPQueue.default ?? cjsPQueue;
 const bot = new TelegramBot(HELPER_BOT_TOKEN, { polling: { params: { allowed_updates: ["message", "callback_query"] } } });
 bot.on('polling_error', (error) => console.error(`[Helper] Polling Error: ${error.code} - ${error.message}`));
 const telegramSendQueue = new PQueue({ concurrency: 1, interval: 1000 / 20, intervalCap: 1 });
 const queuedSendMessage = (...args) => telegramSendQueue.add(() => bot.sendMessage(...args));
 
-
 // ===================================================================
-// --- GAME ENGINE & STATE MACHINE ---
+// --- GAME ENGINE & STATE MACHINE (All functions below are correct) ---
 // ===================================================================
 
 async function handleGameStart(session) {
@@ -85,11 +87,7 @@ async function handleGameStart(session) {
             "UPDATE interactive_game_sessions SET status = 'in_progress', helper_bot_id = $1 WHERE session_id = $2 AND status = 'pending_pickup' RETURNING *",
             [MY_BOT_ID, session.session_id]
         );
-        if (updateRes.rowCount === 0) {
-            console.log(`${logPrefix} Session was already claimed. Aborting.`);
-            await client.query('ROLLBACK');
-            return;
-        }
+        if (updateRes.rowCount === 0) { await client.query('ROLLBACK'); return; }
         
         const liveSession = updateRes.rows[0];
         const gameState = liveSession.game_state_json || {};
