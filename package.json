@@ -1,18 +1,27 @@
 {
-  "name": "helper-interactive-bot",
+  "name": "solana-telegram-bot",
   "version": "1.0.0",
-  "description": "Helper bot for Telegram casino games.",
-  "main": "helper_bot.js",
+  "description": "Solana Casino and Games Bot for Telegram",
+  "main": "index.js",
   "type": "module",
   "scripts": {
-    "start": "node helper_bot.js"
+    "start": "node index.js",
+    "helper": "node helper_bot.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
   },
   "dependencies": {
-    "@solana/web3.js": "^1.91.8",
+    "@solana/web3.js": "^1.91.9",
     "axios": "^1.7.2",
+    "bip39": "^3.1.0",
+    "bs58": "^5.0.0",
     "dotenv": "^16.4.5",
-    "node-telegram-bot-api": "^0.65.1",
+    "ed25519-hd-key": "^1.3.0",
+    "express": "^4.19.2",
+    "node-telegram-bot-api": "^0.66.0",
     "p-queue": "^6.6.2",
-    "pg": "^8.11.5"
+    "pg": "^8.11.5",
+    "tweetnacl": "^1.0.3"
   }
 }
