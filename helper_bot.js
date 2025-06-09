@@ -3,7 +3,7 @@
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
 import { Pool } from 'pg';
-import PQueue from 'p-queue';
+import {default as PQueue} from 'p-queue';
 import axios from 'axios';
 import { LAMPORTS_PER_SOL } from '@solana/web3.js';
 
