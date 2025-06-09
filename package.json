@@ -1,21 +1,18 @@
 {
-  "name": "telegram-casino-helper-bot",
+  "name": "helper-interactive-bot",
   "version": "1.0.0",
-  "description": "A helper bot for handling interactive game sessions and animations.",
+  "description": "Helper bot for Telegram casino games.",
   "main": "helper_bot.js",
   "type": "module",
   "scripts": {
     "start": "node helper_bot.js"
   },
-  "author": "",
-  "license": "ISC",
   "dependencies": {
+    "@solana/web3.js": "^1.91.8",
+    "axios": "^1.7.2",
     "dotenv": "^16.4.5",
     "node-telegram-bot-api": "^0.65.1",
-    "p-queue": "^7.4.1",
+    "p-queue": "^6.6.2",
     "pg": "^8.11.5"
-  },
-  "engines": {
-    "node": ">=18.0.0"
   }
 }
