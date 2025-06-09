@@ -154,37 +154,73 @@ async function runPressYourLuckGame(sessionId) {
     }
 }
 
+// --- Start of REPLACEMENT for promptPressYourLuckAction in helper_bot.js ---
+
 async function promptPressYourLuckAction(session) {
     const gameState = session.game_state_json;
     const gameType = session.game_type;
+    const logPrefix = `[PromptPYL SID:${session.session_id}]`;
 
+    // Delete the previous prompt message if it exists
     if (gameState.lastMessageId) {
         await bot.deleteMessage(session.chat_id, gameState.lastMessageId).catch(() => {});
     }
 
-    const { maxTurns, emoji } = getPressYourLuckConfig(gameType);
-    const currentPayout = BigInt(session.bet_amount_lamports) * BigInt(Math.floor(gameState.currentMultiplier * 100)) / 100n;
-    const cashoutDisplay = await formatBalanceForDisplay(currentPayout, 'USD');
-    const message = `${gameState.p1Name}, Turn ${gameState.turn}/${maxTurns}. Send ${emoji} to play.`;
+    const { maxTurns, emoji, effects } = getPressYourLuckConfig(gameType);
+    const gameName = getCleanGameNameHelper(gameType);
     
-    const keyboard = { inline_keyboard: [] };
-    if (gameState.turn > 1 && gameState.currentMultiplier > 0) {
-        keyboard.inline_keyboard.push([{ text: `💰 Cash Out (${cashoutDisplay})`, callback_data: `interactive_cashout:${session.session_id}` }]);
+    // --- Message Construction ---
+    const betDisplay = await formatBalanceForDisplay(session.bet_amount_lamports, 'USD');
+    let messageHTML = `<b>${emoji} ${escapeHTML(gameName)} ${emoji}</b>\n\n` +
+                      `Player: <b>${escapeHTML(gameState.p1Name)}</b>\n` +
+                      `Wager: <b>${escapeHTML(betDisplay)}</b>\n\n` +
+                      `Frame: <b>${gameState.turn} / ${maxTurns}</b>\n`;
+
+    // Show the outcome of the last roll
+    if (gameState.lastRollValue) {
+        const lastRollEffect = effects[gameState.lastRollValue];
+        messageHTML += `Last Roll: <b>${gameState.lastRollValue} (${lastRollEffect.outcome})</b>\n`;
     }
 
-    const sentMsg = await queuedSendMessage(session.chat_id, message, { reply_markup: keyboard });
+    messageHTML += `Current Multiplier: <b>x${gameState.currentMultiplier.toFixed(2)}</b>\n\n`;
+
+    let callToAction = `Your move. Send ${emoji} to play.`;
+    const keyboard = { inline_keyboard: [] };
     
+    // Logic for the cash-out button and call to action text
+    if (gameState.turn > 1 && gameState.currentMultiplier > 0) {
+        const currentPayout = BigInt(session.bet_amount_lamports) * BigInt(Math.floor(gameState.currentMultiplier * 100)) / 100n;
+        const cashoutDisplay = await formatBalanceForDisplay(currentPayout, 'USD');
+        
+        const lastRollEffect = effects[gameState.lastRollValue];
+        // If the last roll forces another turn (e.g., multiplier is < 1)
+        if (lastRollEffect.multiplier_increase < 1.0) {
+             callToAction = `Your multiplier dropped! You must roll again to improve your score.`;
+             // We still show the cashout button as per your request
+             keyboard.inline_keyboard.push([{ text: `💰 Cash Out & Cut Losses (${cashoutDisplay})`, callback_data: `interactive_cashout:${session.session_id}` }]);
+        } else {
+            callToAction = `Your move. Roll the next frame or take the cash.`;
+            keyboard.inline_keyboard.push([{ text: `💰 Cash Out (${cashoutDisplay})`, callback_data: `interactive_cashout:${session.session_id}` }]);
+        }
+    }
+    
+    messageHTML += callToAction;
+
+    const sentMsg = await queuedSendMessage(session.chat_id, messageHTML, { parse_mode: 'HTML', reply_markup: keyboard });
+    
+    // Save the new message ID and set a timeout for the player's turn
     if (sentMsg) {
         gameState.lastMessageId = sentMsg.message_id;
-        await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
-        
-        if (activeTurnTimeouts.has(session.session_id)) {
+        if(activeTurnTimeouts.has(session.session_id)) {
             clearTimeout(activeTurnTimeouts.get(session.session_id));
         }
         const timeoutId = setTimeout(() => handleGameTimeout(session.session_id), PLAYER_ACTION_TIMEOUT);
         activeTurnTimeouts.set(session.session_id, timeoutId);
+        await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
     }
 }
+
+// --- End of REPLACEMENT for promptPressYourLuckAction ---
 
 async function advancePvPGameState(sessionId) {
     const logPrefix = `[AdvancePvP SID:${sessionId}]`;
