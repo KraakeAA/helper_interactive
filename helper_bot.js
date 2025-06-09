@@ -165,57 +165,84 @@ async function runPressYourLuckGame(sessionId) {
     }
 }
 
+// --- Start of REPLACEMENT for promptPressYourLuckAction in helper_bot.js ---
+
 async function promptPressYourLuckAction(session) {
     const gameState = session.game_state_json;
     const gameType = session.game_type;
-    if (gameState.lastMessageId) {
-        await bot.deleteMessage(session.chat_id, gameState.lastMessageId).catch(() => {});
-    }
 
+    // Build the message content first
     const { maxTurns, emoji, effects } = getPressYourLuckConfig(gameType);
     const gameName = getCleanGameNameHelper(gameType);
     
-    const currentPayout = BigInt(session.bet_amount_lamports) * BigInt(Math.floor(gameState.currentMultiplier * 100)) / 100n;
-    const cashoutDisplay = await formatBalanceForDisplay(currentPayout, 'USD');
     const betDisplay = await formatBalanceForDisplay(session.bet_amount_lamports, 'USD');
-
     let messageHTML = `<b>${emoji} ${escape(gameName)} ${emoji}</b>\n\n` +
                       `Player: <b>${escape(gameState.p1Name)}</b> | Wager: <b>${escape(betDisplay)}</b>\n` +
                       `Current Multiplier: <b>x${gameState.currentMultiplier.toFixed(2)}</b>\n\n`;
 
-    if (gameState.lastRollValue) {
-        const lastRollEffect = effects[gameState.lastRollValue];
-        messageHTML += `Last Roll: <b>${gameState.lastRollValue} (${lastRollEffect.outcome})</b>\n`;
+    let rollsDisplay = "";
+    for (let i = 0; i < maxTurns; i++) {
+        rollsDisplay += `[${gameState.rolls[i] || '_'}] `;
+        if ((i + 1) % 3 === 0 && i < maxTurns - 1) rollsDisplay += " "; // Add space after a round of 3
     }
-    
-    messageHTML += `Turn: <b>${gameState.turn} / ${maxTurns}</b>\n\n`;
-    
-    let callToAction = `Your move. Send ${emoji} to play.`;
-    const keyboard = { inline_keyboard: [] };
-    
-    if (gameState.turn > 1 && gameState.currentMultiplier > 0) {
-        const lastRollEffect = effects[gameState.lastRollValue];
-        if (lastRollEffect.multiplier_increase < 1.0) {
-             callToAction = `Your multiplier dropped! You can cash out for a partial return or risk it all.`;
-             keyboard.inline_keyboard.push([{ text: `💰 Cash Out & Cut Losses (${cashoutDisplay})`, callback_data: `interactive_cashout:${session.session_id}` }]);
-        } else {
-            callToAction = `Your move. Roll the next turn or take the cash.`;
-            keyboard.inline_keyboard.push([{ text: `💰 Cash Out (${cashoutDisplay})`, callback_data: `interactive_cashout:${session.session_id}` }]);
-        }
-    }
-    messageHTML += `<i>${callToAction}</i>`;
+    messageHTML += `Rolls: <code>${rollsDisplay.trim()}</code>\n\n`;
 
-    const sentMsg = await queuedSendMessage(session.chat_id, messageHTML, { parse_mode: 'HTML', reply_markup: keyboard });
+    let callToAction = "";
+    const keyboard = { inline_keyboard: [] };
+    const numRolls = gameState.rolls.length;
+
+    // Logic for prompts and buttons
+    if (numRolls === 0) {
+        callToAction = `Your first round. Send 3 🎳 emojis to begin.`;
+    } else if (numRolls % 3 === 0 && numRolls < maxTurns) {
+        const currentPayout = BigInt(session.bet_amount_lamports) * BigInt(Math.floor(gameState.currentMultiplier * 100)) / 100n;
+        const cashoutDisplay = await formatBalanceForDisplay(currentPayout, 'USD');
+        callToAction = `Round complete! Send 3 🎳 to continue, or cash out.`;
+        keyboard.inline_keyboard.push([{ text: `💰 Cash Out (${cashoutDisplay})`, callback_data: `interactive_cashout:${session.session_id}` }]);
+    } else if (numRolls === maxTurns) {
+        // This state should be handled by finalization, but as a UI fallback:
+        callToAction = `Game complete! Finalizing...`;
+    } else {
+        const roundNum = Math.floor(numRolls / 3) + 1;
+        const rollInRound = (numRolls % 3) + 1;
+        callToAction = `Round ${roundNum}, Roll ${rollInRound}/3. Send 🎳 to roll.`;
+    }
+
+    messageHTML += `<i>${callToAction}</i>`;
+    const messageOptions = { parse_mode: 'HTML', reply_markup: keyboard };
+
+    // Now, either edit the existing message or send a new one
+    let sentMsg;
+    if (gameState.lastMessageId) {
+        try {
+            sentMsg = await bot.editMessageText(messageHTML, { chat_id: session.chat_id, message_id: gameState.lastMessageId, ...messageOptions });
+        } catch (e) {
+            if (e.response && e.response.body.description.includes("message is not modified")) {
+                sentMsg = { message_id: gameState.lastMessageId }; // It's not modified, but we can proceed
+            } else {
+                console.warn(`[PromptHelper] Failed to edit message ${gameState.lastMessageId}, sending new. Error: ${e.message}`);
+                sentMsg = await queuedSendMessage(session.chat_id, messageHTML, messageOptions);
+            }
+        }
+    } else {
+        sentMsg = await queuedSendMessage(session.chat_id, messageHTML, messageOptions);
+    }
     
+    // Save the message ID and manage the timeout
     if (sentMsg) {
         gameState.lastMessageId = sentMsg.message_id;
-        await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
         
-        if (activeTurnTimeouts.has(session.session_id)) clearTimeout(activeTurnTimeouts.get(session.session_id));
+        if (activeTurnTimeouts.has(session.session_id)) {
+            clearTimeout(activeTurnTimeouts.get(session.session_id));
+        }
         const timeoutId = setTimeout(() => handleGameTimeout(session.session_id), PLAYER_ACTION_TIMEOUT);
         activeTurnTimeouts.set(session.session_id, timeoutId);
+        
+        await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
     }
 }
+
+// --- End of REPLACEMENT for promptPressYourLuckAction ---
 
 async function advancePvPGameState(sessionId) {
     const logPrefix = `[AdvancePvP SID:${sessionId}]`;
@@ -305,6 +332,8 @@ async function runBotTurn(session, gameState) {
     await finalizeGame(session, 'pvp_resolve');
 }
 
+// --- Start of REPLACEMENT for handleRollSubmitted in helper_bot.js ---
+
 async function handleRollSubmitted(session, lastRoll) {
     const logPrefix = `[HandleRoll SID:${session.session_id}]`;
     let client = null;
@@ -328,15 +357,15 @@ async function handleRollSubmitted(session, lastRoll) {
             const playerKey = (String(gameState.initiatorId) === currentPlayerId) ? 'p1' : 'p2';
             if (!gameState[`${playerKey}Rolls`]) gameState[`${playerKey}Rolls`] = [];
             gameState[`${playerKey}Rolls`].push(rollValue);
-            gameState.currentTurnStartTime = Date.now();
             await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), liveSession.session_id]);
             await advancePvPGameState(liveSession.session_id);
-        } else {
+        } else { // "Press Your Luck" game
             gameState.rolls.push(rollValue);
             gameState.lastRollValue = rollValue;
             const effect = getPressYourLuckConfig(liveSession.game_type).effects[rollValue];
             gameState.currentMultiplier = (gameState.currentMultiplier || 1.0) * effect.multiplier_increase;
-            gameState.turn++;
+            
+            // This now saves the state, and runPressYourLuckGame will handle the next UI update
             await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), liveSession.session_id]);
             await runPressYourLuckGame(liveSession.session_id);
         }
@@ -346,6 +375,8 @@ async function handleRollSubmitted(session, lastRoll) {
         if (client) client.release();
     }
 }
+
+// --- End of REPLACEMENT for handleRollSubmitted ---
 
 async function finalizeGame(session, finalStatus) {
     const sessionId = session.session_id;
