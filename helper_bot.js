@@ -1,4 +1,4 @@
-// helper_bot.js - FINAL UNIFIED VERSION v9 - All Game Logic Restored, No Omissions
+// helper_bot.js - FINAL UNIFIED VERSION v9 - All Logic & Functions Included, No Omissions
 
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
@@ -57,10 +57,6 @@ const DOWNTOWN_SHOOTOUT_EFFECTS = {
 const PVP_BOWLING_FRAMES = 3;
 const PVP_BASKETBALL_SHOTS = 5;
 const PVP_DARTS_THROWS = 3;
-const THREE_POINT_PAYOUTS = [1.5, 2.2, 3.5, 5.0, 10.0, 20.0, 50.0];
-const PINPOINT_BOWLING_PAYOUT_MULTIPLIER = 5.5;
-const DARTS_FORTUNE_PAYOUTS = { 6: 3.5, 5: 1.5, 4: 0.5, 3: 0.2, 2: 0.1, 1: 0.0 };
-
 
 // --- Database & Bot Setup ---
 if (!HELPER_BOT_TOKEN || !DATABASE_URL) {
@@ -74,13 +70,12 @@ bot.on('polling_error', (error) => console.error(`[Helper] Polling Error: ${erro
 const telegramSendQueue = new PQueue({ concurrency: 1, interval: 1000 / 20, intervalCap: 1 });
 const queuedSendMessage = (...args) => telegramSendQueue.add(() => bot.sendMessage(...args));
 
-
 // ===================================================================
 // --- GAME ENGINE & STATE MACHINE ---
 // ===================================================================
 
 async function handleGameStart(session) {
-    const logPrefix = `[HandleStart_V6 SID:${session.session_id}]`;
+    const logPrefix = `[HandleStart_V7 SID:${session.session_id}]`;
     console.log(`${logPrefix} Initializing game: ${session.game_type}`);
     let client = null;
     try {
@@ -96,11 +91,10 @@ async function handleGameStart(session) {
         const gameState = liveSession.game_state_json || {};
         const gameType = liveSession.game_type;
         
-        // This acts as a router for different game types
-        const isNewPressYourLuck = ['bowling', 'darts', 'basketball'].includes(gameType) && !gameType.includes('_pvp');
+        const isPressYourLuck = ['bowling', 'darts', 'basketball'].includes(gameType) && !gameType.includes('_pvp');
         const isNewPvPDuel = gameType.includes('_pvp');
-
-        if (isNewPressYourLuck) {
+        
+        if (isPressYourLuck) {
              gameState.turn = 1;
              gameState.rolls = [];
              gameState.currentMultiplier = 1.0;
@@ -111,15 +105,13 @@ async function handleGameStart(session) {
         
         gameState.p1Name = gameState.initiatorName || "Player 1";
         gameState.currentPlayerTurn = String(gameState.initiatorId || liveSession.user_id);
-        gameState.currentTurnStartTime = Date.now();
         if (gameState.gameMode === 'pvp') gameState.p2Name = gameState.opponentName || "Player 2";
         
         await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), liveSession.session_id]);
         await client.query('COMMIT');
 
-        // Route to the correct game logic
-        if (isNewPressYourLuck) {
-            await runPressYourLuckGame(liveSession.session_id);
+        if (isPressYourLuck) {
+            await updateKingpinChallengeState(liveSession.session_id);
         } else if (isNewPvPDuel) {
             await advancePvPGameState(liveSession.session_id);
         } else {
@@ -134,8 +126,8 @@ async function handleGameStart(session) {
     }
 }
 
-async function runPressYourLuckGame(sessionId) {
-    const logPrefix = `[PressYourLuck SID:${sessionId}]`;
+async function updateKingpinChallengeState(sessionId) {
+    const logPrefix = `[UpdateKingpinState SID:${sessionId}]`;
     let client = null;
     try {
         client = await pool.connect();
@@ -144,105 +136,73 @@ async function runPressYourLuckGame(sessionId) {
 
         const session = res.rows[0];
         const gameState = session.game_state_json;
-        const gameType = session.game_type;
-        const { maxTurns, effects } = getPressYourLuckConfig(gameType);
-        const lastRoll = gameState.lastRollValue;
+        const rolls = gameState.rolls || [];
+        const numRolls = rolls.length;
+        const { maxTurns, emoji, effects } = getPressYourLuckConfig(session.game_type);
 
-        if (lastRoll && effects[lastRoll]?.multiplier_increase === 0.0) {
+        const lastRoll = rolls[numRolls - 1];
+        if (lastRoll === 1) {
             await finalizeGame(session, 'completed_loss');
             return;
         }
-        if (gameState.turn > maxTurns) {
+        if (numRolls >= maxTurns) {
             await finalizeGame(session, 'completed_cashout');
             return;
         }
-        await promptPressYourLuckAction(session);
-    } catch (e) {
-        console.error(`${logPrefix} Error in game loop: ${e.message}`);
-        await finalizeGame({session_id: sessionId}, 'error');
-    } finally {
-        if (client) client.release();
-    }
-}
 
-// --- Start of REPLACEMENT for promptPressYourLuckAction in helper_bot.js ---
+        const betDisplay = await formatBalanceForDisplay(session.bet_amount_lamports, 'USD');
+        let messageHTML = `<b>🎳 Kingpin's Challenge 🎳</b>\n\n` +
+                          `Player: <b>${escape(gameState.p1Name)}</b> | Wager: <b>${escape(betDisplay)}</b>\n` +
+                          `Multiplier: <b>x${gameState.currentMultiplier.toFixed(2)}</b>\n\n`;
 
-async function promptPressYourLuckAction(session) {
-    const gameState = session.game_state_json;
-    const gameType = session.game_type;
+        let rollsDisplay = "";
+        for (let i = 0; i < maxTurns; i++) {
+            rollsDisplay += `[${rolls[i] || '_'}] `;
+            if ((i + 1) % 3 === 0 && i < maxTurns - 1) rollsDisplay += " ";
+        }
+        messageHTML += `Rolls: <code>${rollsDisplay.trim()}</code>\n\n`;
 
-    // Build the message content first
-    const { maxTurns, emoji, effects } = getPressYourLuckConfig(gameType);
-    const gameName = getCleanGameNameHelper(gameType);
-    
-    const betDisplay = await formatBalanceForDisplay(session.bet_amount_lamports, 'USD');
-    let messageHTML = `<b>${emoji} ${escape(gameName)} ${emoji}</b>\n\n` +
-                      `Player: <b>${escape(gameState.p1Name)}</b> | Wager: <b>${escape(betDisplay)}</b>\n` +
-                      `Current Multiplier: <b>x${gameState.currentMultiplier.toFixed(2)}</b>\n\n`;
+        const keyboard = { inline_keyboard: [] };
+        let callToAction = "";
 
-    let rollsDisplay = "";
-    for (let i = 0; i < maxTurns; i++) {
-        rollsDisplay += `[${gameState.rolls[i] || '_'}] `;
-        if ((i + 1) % 3 === 0 && i < maxTurns - 1) rollsDisplay += " "; // Add space after a round of 3
-    }
-    messageHTML += `Rolls: <code>${rollsDisplay.trim()}</code>\n\n`;
-
-    let callToAction = "";
-    const keyboard = { inline_keyboard: [] };
-    const numRolls = gameState.rolls.length;
-
-    // Logic for prompts and buttons
-    if (numRolls === 0) {
-        callToAction = `Your first round. Send 3 🎳 emojis to begin.`;
-    } else if (numRolls % 3 === 0 && numRolls < maxTurns) {
-        const currentPayout = BigInt(session.bet_amount_lamports) * BigInt(Math.floor(gameState.currentMultiplier * 100)) / 100n;
-        const cashoutDisplay = await formatBalanceForDisplay(currentPayout, 'USD');
-        callToAction = `Round complete! Send 3 🎳 to continue, or cash out.`;
-        keyboard.inline_keyboard.push([{ text: `💰 Cash Out (${cashoutDisplay})`, callback_data: `interactive_cashout:${session.session_id}` }]);
-    } else if (numRolls === maxTurns) {
-        // This state should be handled by finalization, but as a UI fallback:
-        callToAction = `Game complete! Finalizing...`;
-    } else {
-        const roundNum = Math.floor(numRolls / 3) + 1;
-        const rollInRound = (numRolls % 3) + 1;
-        callToAction = `Round ${roundNum}, Roll ${rollInRound}/3. Send 🎳 to roll.`;
-    }
-
-    messageHTML += `<i>${callToAction}</i>`;
-    const messageOptions = { parse_mode: 'HTML', reply_markup: keyboard };
-
-    // Now, either edit the existing message or send a new one
-    let sentMsg;
-    if (gameState.lastMessageId) {
-        try {
-            sentMsg = await bot.editMessageText(messageHTML, { chat_id: session.chat_id, message_id: gameState.lastMessageId, ...messageOptions });
-        } catch (e) {
-            if (e.response && e.response.body.description.includes("message is not modified")) {
-                sentMsg = { message_id: gameState.lastMessageId }; // It's not modified, but we can proceed
+        if (numRolls > 0 && numRolls % 3 === 0) {
+            const currentPayout = BigInt(session.bet_amount_lamports) * BigInt(Math.floor(gameState.currentMultiplier * 100)) / 100n;
+            const cashoutDisplay = await formatBalanceForDisplay(currentPayout, 'USD');
+            if (numRolls === 9) {
+                 callToAction = `Final round complete! Cash out now, or send one final 🎳 for an all-or-nothing win!`;
             } else {
-                console.warn(`[PromptHelper] Failed to edit message ${gameState.lastMessageId}, sending new. Error: ${e.message}`);
-                sentMsg = await queuedSendMessage(session.chat_id, messageHTML, messageOptions);
+                 callToAction = `Round complete! Send 3 🎳 to continue, or cash out.`;
             }
+            keyboard.inline_keyboard.push([{ text: `💰 Cash Out (${cashoutDisplay})`, callback_data: `interactive_cashout:${sessionId}` }]);
+        } else {
+            const roundNum = Math.floor(numRolls / 3) + 1;
+            const rollInRound = (numRolls % 3) + 1;
+            callToAction = `Round ${roundNum}, Roll ${rollInRound}/3. Send 🎳 to roll.`;
         }
-    } else {
-        sentMsg = await queuedSendMessage(session.chat_id, messageHTML, messageOptions);
-    }
-    
-    // Save the message ID and manage the timeout
-    if (sentMsg) {
-        gameState.lastMessageId = sentMsg.message_id;
+        messageHTML += `<i>${callToAction}</i>`;
         
-        if (activeTurnTimeouts.has(session.session_id)) {
-            clearTimeout(activeTurnTimeouts.get(session.session_id));
+        const messageOptions = { parse_mode: 'HTML', reply_markup: keyboard };
+        let sentMsg;
+        if (gameState.lastMessageId) {
+            sentMsg = await bot.editMessageText(messageHTML, { chat_id: session.chat_id, message_id: gameState.lastMessageId, ...messageOptions }).catch(() => null);
+            if (!sentMsg) sentMsg = await queuedSendMessage(session.chat_id, messageHTML, messageOptions);
+        } else {
+            sentMsg = await queuedSendMessage(session.chat_id, messageHTML, messageOptions);
         }
-        const timeoutId = setTimeout(() => handleGameTimeout(session.session_id), PLAYER_ACTION_TIMEOUT);
-        activeTurnTimeouts.set(session.session_id, timeoutId);
         
-        await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
+        if (sentMsg) {
+            gameState.lastMessageId = sentMsg.message_id;
+            await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), sessionId]);
+            if (activeTurnTimeouts.has(sessionId)) clearTimeout(activeTurnTimeouts.get(sessionId));
+            const timeoutId = setTimeout(() => handleGameTimeout(sessionId), PLAYER_ACTION_TIMEOUT);
+            activeTurnTimeouts.set(sessionId, timeoutId);
+        }
+    } catch(e) {
+        console.error(`${logPrefix} Error: ${e.message}`);
+    } finally {
+        if(client) client.release();
     }
 }
-
-// --- End of REPLACEMENT for promptPressYourLuckAction ---
 
 async function advancePvPGameState(sessionId) {
     const logPrefix = `[AdvancePvP SID:${sessionId}]`;
@@ -306,34 +266,6 @@ async function promptPvPAction(session, gameState) {
     await queuedSendMessage(chat_id, messageHTML, { parse_mode: 'HTML' });
 }
 
-async function runBotTurn(session, gameState) {
-    await queuedSendMessage(session.chat_id, `🤖 The Bot Dealer is now taking its turn...`, { parse_mode: 'HTML' });
-    await sleep(2000);
-
-    const shotsPerPlayer = getShotsPerPlayer(session.game_type);
-    let botRolls = [];
-    for (let i = 0; i < shotsPerPlayer; i++) {
-        try {
-            const diceMessage = await bot.sendDice(session.chat_id, { emoji: getGameEmoji(session.game_type) });
-            if (!diceMessage || !diceMessage.dice) throw new Error("Failed to get dice value from Telegram API.");
-            botRolls.push(diceMessage.dice.value);
-            await sleep(4000); 
-        } catch (e) {
-            console.error(`[RunBotTurn] Failed to send animated dice, using internal roll. Error: ${e.message}`);
-            const internalRoll = Math.floor(Math.random() * 6) + 1;
-            botRolls.push(internalRoll);
-            await queuedSendMessage(session.chat_id, `(Bot's internal roll ${i+1}: <b>${internalRoll}</b>)`);
-            await sleep(1000);
-        }
-    }
-    
-    gameState.p2Rolls = botRolls;
-    await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
-    await finalizeGame(session, 'pvp_resolve');
-}
-
-// --- Start of REPLACEMENT for handleRollSubmitted in helper_bot.js ---
-
 async function handleRollSubmitted(session, lastRoll) {
     const logPrefix = `[HandleRoll SID:${session.session_id}]`;
     let client = null;
@@ -359,15 +291,13 @@ async function handleRollSubmitted(session, lastRoll) {
             gameState[`${playerKey}Rolls`].push(rollValue);
             await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), liveSession.session_id]);
             await advancePvPGameState(liveSession.session_id);
-        } else { // "Press Your Luck" game
+        } else {
             gameState.rolls.push(rollValue);
             gameState.lastRollValue = rollValue;
             const effect = getPressYourLuckConfig(liveSession.game_type).effects[rollValue];
             gameState.currentMultiplier = (gameState.currentMultiplier || 1.0) * effect.multiplier_increase;
-            
-            // This now saves the state, and runPressYourLuckGame will handle the next UI update
             await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), liveSession.session_id]);
-            await runPressYourLuckGame(liveSession.session_id);
+            await updateKingpinChallengeState(liveSession.session_id);
         }
     } catch (e) {
         console.error(`${logPrefix} Error handling submitted roll: ${e.message}`);
@@ -375,8 +305,6 @@ async function handleRollSubmitted(session, lastRoll) {
         if (client) client.release();
     }
 }
-
-// --- End of REPLACEMENT for handleRollSubmitted ---
 
 async function finalizeGame(session, finalStatus) {
     const sessionId = session.session_id;
@@ -432,10 +360,6 @@ async function finalizeGame(session, finalStatus) {
         if(client) client.release();
     }
 }
-
-// ===================================================================
-// --- EVENT HANDLERS & MAIN LOOP ---
-// ===================================================================
 
 bot.on('callback_query', async (callbackQuery) => {
     const data = callbackQuery.data;
@@ -508,9 +432,12 @@ async function processPendingGames() {
 }
 processPendingGames.isRunning = false;
 
-// ===================================================================
 // --- UTILITY FUNCTIONS ---
-// ===================================================================
+
+function escape(text) {
+    if (text === null || typeof text === 'undefined') return '';
+    return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+}
 
 function stringifyWithBigInt(obj) { return JSON.stringify(obj, (key, value) => (typeof value === 'bigint' ? value.toString() + 'n' : value), 2); }
 async function fetchSolUsdPriceFromBinanceAPI() { try { const response = await axios.get('https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT', { timeout: 8000 }); if (response.data?.price) return parseFloat(response.data.price); throw new Error('Invalid price data from Binance API.'); } catch (error) { throw error; }}
@@ -519,7 +446,7 @@ async function getSolUsdPrice() { const cached = solPriceCache.get(SOL_PRICE_CAC
 function convertLamportsToUSDString(lamports, solUsdPrice, d = 2) { if (typeof solUsdPrice !== 'number' || solUsdPrice <= 0) return 'N/A'; const sol = Number(BigInt(lamports)) / Number(LAMPORTS_PER_SOL); return `$${(sol * solUsdPrice).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d })}`;}
 async function formatBalanceForDisplay(lamports, currency = 'USD') { if (currency === 'USD') { try { const price = await getSolUsdPrice(); return convertLamportsToUSDString(lamports, price); } catch (e) { return 'N/A'; } } return `${(Number(BigInt(lamports)) / Number(LAMPORTS_PER_SOL)).toFixed(SOL_DECIMALS)} SOL`;}
 function getPressYourLuckConfig(gameType) { switch(gameType) { case 'bowling': return { maxTurns: BOWLING_FRAMES, effects: KINGPIN_ROLL_EFFECTS, emoji: '🎳' }; case 'darts': return { maxTurns: DARTS_THROWS_TOTAL, effects: BULLSEYE_BLITZ_EFFECTS, emoji: '🎯' }; case 'basketball': return { maxTurns: BASKETBALL_SHOTS_TOTAL, effects: DOWNTOWN_SHOOTOUT_EFFECTS, emoji: '🏀' }; default: return { maxTurns: 1, effects: {}, emoji: '🎲' }; }}
-function getShotsPerPlayer(gameType) { const lt = String(gameType).toLowerCase(); if (lt.includes('bowling_duel_pvp')) return PVP_BOWLING_FRAMES; if (lt.includes('basketball_clash_pvp')) return PVP_BASKETBALL_SHOTS; if (lt.includes('darts_duel_pvp')) return PVP_DARTS_THROWS; if (lt === 'bowling') return BOWLING_FRAMES; if (lt === 'basketball') return BASKETBALL_SHOTS_TOTAL; if (lt === 'darts') return DARTS_THROWS_TOTAL; return 1; }
+function getShotsPerPlayer(gameType) { const lt = String(gameType).toLowerCase(); if (lt.includes('bowling_duel_pvp')) return PVP_BOWLING_FRAMES; if (lt.includes('basketball_clash_pvp')) return PVP_BASKETBALL_SHOTS; if (lt.includes('darts_duel_pvp')) return PVP_DARTS_THROWS; return 1; }
 function calculateFinalScore(gameType, rolls) { const safeRolls = rolls || []; if (safeRolls.length === 0) return 0; if (gameType.includes('basketball')) return safeRolls.filter(r => r >= 4).length; return safeRolls.reduce((a, b) => a + b, 0); }
 function getCleanGameNameHelper(gameType) { if (!gameType) return "Game"; const lt = String(gameType).toLowerCase(); if (lt.includes('bowling_duel_pvp')) return "Bowling Duel"; if (lt.includes('darts_duel_pvp')) return "Darts Showdown"; if (lt.includes('basketball_clash_pvp')) return "3-Point Clash"; if (lt === 'bowling') return "Kingpin's Challenge"; if (lt === 'darts') return "Bullseye Blitz"; if (lt === 'basketball') return "Downtown Shootout"; return "Game"; }
 function getGameEmoji(gameType) { if (gameType.includes('bowling')) return '🎳'; if (gameType.includes('darts')) return '🎯'; if (gameType.includes('basketball')) return '🏀'; return '🎲'; }
