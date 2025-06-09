@@ -201,12 +201,16 @@ async function promptNextPlayer(session, gameState) {
     const emoji = getGameEmoji(game_type);
     const shotsPerPlayer = getShotsPerPlayer(game_type);
     
-    const nextPlayerName = (String(currentPlayerTurn) === String(initiatorId)) ? p1Name : (p2Name || "Bot");
-    const nextPlayerRolls = (String(currentPlayerTurn) === String(initiatorId)) ? p1Rolls : (p2Rolls || []);
+    // --- FIX IS HERE: Calculate scores before building the message ---
+    const p1Score = calculateFinalScore(game_type, p1Rolls);
+    const p2Score = calculateFinalScore(game_type, p2Rolls);
 
-    let scoreBoardHTML = `<b>${p1Name}:</b> ${formatRollsHelper(p1Rolls || [])}\n`;
+    const nextPlayerName = (String(currentPlayerTurn) === String(initiatorId)) ? p1Name : (p2Name || "Bot");
+    const nextPlayerRolls = (String(currentPlayerTurn) === String(initiatorId)) ? (p1Rolls || []) : (p2Rolls || []);
+
+    let scoreBoardHTML = `<b>${p1Name}:</b> ${formatRollsHelper(p1Rolls || [])} ➠ Score: <b>${p1Score}</b>\n`;
     if(gameState.gameMode === 'pvp') {
-        scoreBoardHTML += `<b>${p2Name}:</b> ${formatRollsHelper(p2Rolls || [])}`;
+        scoreBoardHTML += `<b>${p2Name}:</b> ${formatRollsHelper(p2Rolls || [])} ➠ Score: <b>${p2Score}</b>`;
     }
 
     let messageHTML = `⚔️ <b>${gameName}</b> ⚔️\n\n` +
@@ -307,11 +311,16 @@ function getShotsPerPlayer(gameType) {
 }
 
 function calculateFinalScore(gameType, rolls) {
-    if (!rolls) return 0;
+    const safeRolls = rolls || [];
+    if (safeRolls.length === 0) return 0;
+
+    // In basketball, score is the count of successful shots (a roll of 4, 5, or 6)
     if (gameType.includes('basketball')) {
-        return rolls.filter(r => r >= 4).length;
+        return safeRolls.filter(r => r >= 4).length;
     }
-    return rolls.reduce((a, b) => a + b, 0);
+    
+    // For all other duel games (Bowling, Darts), the score is the sum of the rolls.
+    return safeRolls.reduce((a, b) => a + b, 0);
 }
 
 function getCleanGameNameHelper(gameType) {
