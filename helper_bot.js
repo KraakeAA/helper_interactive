@@ -1,4 +1,4 @@
-// helper_bot.js - FINAL VERSION with Turn-Based PvP/PvB and Original Game Logic
+// helper_bot.js - FINAL VERSION with Crash Fix and All Game Logic
 
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
@@ -9,8 +9,8 @@ import PQueue from 'p-queue';
 const HELPER_BOT_TOKEN = process.env.HELPER_BOT_TOKEN;
 const DATABASE_URL = process.env.DATABASE_URL;
 const MY_BOT_ID = process.env.HELPER_BOT_ID || 'HelperBot_1';
-const GAME_LOOP_INTERVAL = 5000; // Fallback poller for original games
-const PLAYER_CHOICE_TIMEOUT = 60000; // For original interactive games
+const GAME_LOOP_INTERVAL = 5000;
+const PLAYER_CHOICE_TIMEOUT = 60000;
 
 // --- Basic Utilities ---
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -41,20 +41,14 @@ const queuedSendMessage = (...args) => telegramSendQueue.add(() => bot.sendMessa
 // --- NEW TURN-BASED GAME ENGINE ---
 // ===================================================================
 
-/**
- * Triggered on new game session pickup. Initializes the game state.
- * @param {object} session - The session object from the database.
- */
 async function handleGameStart(session) {
     const logPrefix = `[HandleStart SID:${session.session_id}]`;
     console.log(`${logPrefix} Initializing new interactive game.`);
     const gameState = session.game_state_json || {};
     
-    // Initialize game state
     gameState.p1Rolls = [];
     gameState.p1Score = 0;
     gameState.currentPlayerTurn = gameState.initiatorId || session.user_id;
-    gameState.currentTurnNumber = 1;
 
     if (gameState.gameMode === 'pvp') {
         gameState.p2Rolls = [];
@@ -65,10 +59,6 @@ async function handleGameStart(session) {
     await advanceGameState(session.session_id);
 }
 
-/**
- * Triggered when a player's roll is submitted. It records the roll and advances the game state.
- * @param {object} session - The full session object from the database.
- */
 async function handleRollSubmitted(session) {
     const logPrefix = `[HandleRoll SID:${session.session_id}]`;
     let client = null;
@@ -105,10 +95,6 @@ async function handleRollSubmitted(session) {
     }
 }
 
-/**
- * The main state machine. Checks the game's status and decides what to do next.
- * @param {number} sessionId - The ID of the game session to process.
- */
 async function advanceGameState(sessionId) {
     const logPrefix = `[AdvanceState SID:${sessionId}]`;
     let client = null;
@@ -124,19 +110,19 @@ async function advanceGameState(sessionId) {
         const isPvP = gameState.gameMode === 'pvp';
         const gameType = session.game_type;
 
-        const shotsPerPlayer = gameType.includes('bowling') ? BOWLING_FRAMES : gameType.includes('basketball') ? BASKETBALL_SHOTS : DARTS_THROWS;
+        const shotsPerPlayer = gameType.includes('bowling_duel') ? BOWLING_FRAMES : gameType.includes('basketball_clash') ? BASKETBALL_SHOTS : DARTS_THROWS;
 
         const p1_done = gameState.p1Rolls.length >= shotsPerPlayer;
-        const p2_done_pvp = isPvP ? (gameState.p2Rolls.length >= shotsPerPlayer) : true;
+        const p2_done = isPvP ? (gameState.p2Rolls.length >= shotsPerPlayer) : true;
         
-        if (p1_done && p2_done_pvp) {
+        if (p1_done && p2_done) {
             await finalizeGameSession(session, gameState);
             return;
         }
 
         if (!p1_done) {
             gameState.currentPlayerTurn = gameState.initiatorId;
-        } else if (isPvP && !p2_done_pvp) {
+        } else if (isPvP && !p2_done) {
             gameState.currentPlayerTurn = gameState.opponentId;
         } else if (!isPvP && p1_done) { 
             await runBotTurn(session, gameState);
@@ -153,21 +139,16 @@ async function advanceGameState(sessionId) {
     }
 }
 
-/**
- * Sends a message to the chat prompting the correct player for their turn.
- * @param {object} session - The game session object.
- * @param {object} gameState - The current state of the game.
- */
 async function promptNextPlayer(session, gameState) {
     const { chat_id, game_type } = session;
     const { p1Name, p2Name, p1Rolls, p2Rolls, currentPlayerTurn, initiatorId } = gameState;
     
     const gameName = getCleanGameNameHelper(game_type);
     const emoji = getGameEmoji(game_type);
-    const shotsPerPlayer = game_type.includes('bowling') ? BOWLING_FRAMES : game_type.includes('basketball') ? BASKETBALL_SHOTS : DARTS_THROWS;
+    const shotsPerPlayer = game_type.includes('bowling_duel') ? BOWLING_FRAMES : game_type.includes('basketball_clash') ? BASKETBALL_SHOTS : DARTS_THROWS;
     
     const nextPlayerName = (currentPlayerTurn === initiatorId) ? p1Name : (p2Name || "Bot");
-    const nextPlayerRolls = (currentPlayerTurn === initiatorId) ? p1Rolls : p2Rolls;
+    const nextPlayerRolls = (currentPlayerTurn === initiatorId) ? p1Rolls : (p2Rolls || []);
 
     let messageHTML = `⚔️ <b>${gameName}</b> ⚔️\n\n` +
                       `<b>${p1Name}:</b> ${formatRollsHelper(p1Rolls)}\n` +
@@ -177,13 +158,8 @@ async function promptNextPlayer(session, gameState) {
     await queuedSendMessage(chat_id, messageHTML, { parse_mode: 'HTML' });
 }
 
-/**
- * Handles the logic for the bot's turn in a PvB duel game.
- * @param {object} session - The game session object.
- * @param {object} gameState - The current state of the game.
- */
 async function runBotTurn(session, gameState) {
-    const shotsPerPlayer = session.game_type.includes('bowling') ? BOWLING_FRAMES : 1;
+    const shotsPerPlayer = session.game_type.includes('bowling_duel') ? BOWLING_FRAMES : 1;
     let botRolls = [];
     for (let i = 0; i < shotsPerPlayer; i++) {
         botRolls.push(Math.floor(Math.random() * 6) + 1);
@@ -193,18 +169,12 @@ async function runBotTurn(session, gameState) {
     await finalizeGameSession(session, gameState);
 }
 
-/**
- * Calculates final scores, determines the winner, and notifies the main bot.
- * @param {object} session - The game session object.
- * @param {object} gameState - The final state of the game.
- */
 async function finalizeGameSession(session, gameState) {
     const { game_type } = session;
-    let { p1Score, p2Score, p1Rolls, p2Rolls } = gameState;
-
     const isBasketball = game_type.includes('basketball');
-    p1Score = isBasketball ? p1Rolls.filter(r => r >= 4).length : p1Rolls.reduce((a, b) => a + b, 0);
-    p2Score = isBasketball ? (p2Rolls || []).filter(r => r >= 4).length : (p2Rolls || []).reduce((a, b) => a + b, 0);
+    
+    const p1Score = isBasketball ? gameState.p1Rolls.filter(r => r >= 4).length : gameState.p1Rolls.reduce((a, b) => a + b, 0);
+    const p2Score = isBasketball ? (gameState.p2Rolls || []).filter(r => r >= 4).length : (gameState.p2Rolls || []).reduce((a, b) => a + b, 0);
 
     gameState.p1Score = p1Score;
     gameState.p2Score = p2Score;
@@ -327,7 +297,6 @@ async function processThreePointShot(sessionId) {
     }
 }
 
-
 // --- LISTENERS (Callbacks & Database Notifications) ---
 
 bot.on('callback_query', async (callbackQuery) => {
@@ -409,7 +378,7 @@ async function setupNotificationListeners() {
     listeningClient.on('notification', (msg) => {
         try {
             const payload = JSON.parse(msg.payload);
-            const session = payload.session || payload;
+            const session = payload.session || payload; // Adapt to different payload structures
             if (!session || !session.session_id) return;
 
             if (msg.channel === 'game_session_pickup') {
@@ -428,6 +397,7 @@ async function setupNotificationListeners() {
     await listeningClient.query('LISTEN interactive_roll_submitted');
     console.log("✅ [Helper] Now listening for 'game_session_pickup' and 'interactive_roll_submitted' notifications.");
 }
+
 
 // --- Utility Functions for Helper ---
 function getCleanGameNameHelper(gameType) {
@@ -454,33 +424,26 @@ function formatRollsHelper(rolls) {
     return rolls.map(r => `<b>${r}</b>`).join(' ');
 }
 
-
-// --- Main Execution ---
-console.log('🚀 Helper Bot starting...');
-setupNotificationListeners().catch(e => {
-    console.error("CRITICAL: Could not set up notification listeners.", e);
-    process.exit(1);
-});
-
-// Fallback poller for any missed notifications or old game types
-setInterval(() => {
-    const logPrefix = '[Helper] Fallback Poller';
+// --- THIS IS THE CORRECTED FALLBACK POLLER ---
+async function processInteractiveGames() {
     if (processInteractiveGames.isRunning) return;
     processInteractiveGames.isRunning = true;
+    const logPrefix = '[Helper] Fallback Poller';
     
     let client = null;
     try {
-        client = pool.connect();
-        const pendingSessions = client.query("SELECT * FROM interactive_game_sessions WHERE status = 'pending_pickup' AND game_type IN ('bowling', 'darts', 'basketball') ORDER BY created_at ASC LIMIT 5 FOR UPDATE SKIP LOCKED");
+        client = await pool.connect();
+        // This poller now only looks for the ORIGINAL game types
+        const pendingSessions = await client.query("SELECT * FROM interactive_game_sessions WHERE status = 'pending_pickup' AND game_type IN ('bowling', 'darts', 'basketball') ORDER BY created_at ASC LIMIT 5 FOR UPDATE SKIP LOCKED");
 
         for (const session of pendingSessions.rows) {
             console.log(`${logPrefix} Picked up original game session ${session.session_id} (Type: ${session.game_type})`);
-            client.query("UPDATE interactive_game_sessions SET status = 'in_progress', helper_bot_id = $1 WHERE session_id = $2", [MY_BOT_ID, session.session_id]);
+            await client.query("UPDATE interactive_game_sessions SET status = 'in_progress', helper_bot_id = $1 WHERE session_id = $2", [MY_BOT_ID, session.session_id]);
             
             switch (session.game_type) {
-                case 'bowling': runOriginalPinpointBowling(session); break;
-                case 'darts': runDartsFortune(session); break;
-                case 'basketball': runThreePointShootout(session); break;
+                case 'bowling': await runOriginalPinpointBowling(session); break;
+                case 'darts': await runDartsFortune(session); break;
+                case 'basketball': await runThreePointShootout(session); break;
             }
         }
     } catch (e) {
@@ -489,4 +452,17 @@ setInterval(() => {
         if (client) client.release();
         processInteractiveGames.isRunning = false;
     }
-}, GAME_LOOP_INTERVAL);
+}
+// This line is crucial for the poller's isRunning check
+processInteractiveGames.isRunning = false;
+
+
+// --- Main Execution ---
+console.log('🚀 Helper Bot starting...');
+setupNotificationListeners().catch(e => {
+    console.error("CRITICAL: Could not set up notification listeners.", e);
+    process.exit(1);
+});
+
+// The fallback poller for original games
+setInterval(processInteractiveGames, GAME_LOOP_INTERVAL);
