@@ -1,4 +1,4 @@
-// helper_bot.js - FINAL UNIFIED VERSION v7 - Corrects PQueue import error.
+// helper_bot.js - FINAL UNIFIED VERSION v7 - All-in-One, All Fixes Included
 
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
@@ -17,7 +17,7 @@ const PLAYER_ACTION_TIMEOUT = 90000;
 // --- Basic Utilities ---
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// --- Price Fetching & Formatting Dependencies ---
+// --- Price Fetching Dependencies ---
 const SOL_DECIMALS = 9;
 const solPriceCache = new Map();
 const SOL_PRICE_CACHE_KEY = 'sol_usd_price_cache';
@@ -64,8 +64,6 @@ if (!HELPER_BOT_TOKEN || !DATABASE_URL) {
     process.exit(1);
 }
 const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
-
-// --- THIS IS THE CORRECTED PQUEUE INITIALIZATION ---
 const PQueue = cjsPQueue.default ?? cjsPQueue;
 const bot = new TelegramBot(HELPER_BOT_TOKEN, { polling: { params: { allowed_updates: ["message", "callback_query"] } } });
 bot.on('polling_error', (error) => console.error(`[Helper] Polling Error: ${error.code} - ${error.message}`));
@@ -73,7 +71,7 @@ const telegramSendQueue = new PQueue({ concurrency: 1, interval: 1000 / 20, inte
 const queuedSendMessage = (...args) => telegramSendQueue.add(() => bot.sendMessage(...args));
 
 // ===================================================================
-// --- GAME ENGINE & STATE MACHINE (All functions below are correct) ---
+// --- GAME ENGINE & STATE MACHINE ---
 // ===================================================================
 
 async function handleGameStart(session) {
@@ -154,14 +152,10 @@ async function runPressYourLuckGame(sessionId) {
     }
 }
 
-// --- Start of REPLACEMENT for promptPressYourLuckAction in helper_bot.js ---
-
 async function promptPressYourLuckAction(session) {
     const gameState = session.game_state_json;
     const gameType = session.game_type;
-    const logPrefix = `[PromptPYL SID:${session.session_id}]`;
 
-    // Delete the previous prompt message if it exists
     if (gameState.lastMessageId) {
         await bot.deleteMessage(session.chat_id, gameState.lastMessageId).catch(() => {});
     }
@@ -169,58 +163,49 @@ async function promptPressYourLuckAction(session) {
     const { maxTurns, emoji, effects } = getPressYourLuckConfig(gameType);
     const gameName = getCleanGameNameHelper(gameType);
     
-    // --- Message Construction ---
+    const currentPayout = BigInt(session.bet_amount_lamports) * BigInt(Math.floor(gameState.currentMultiplier * 100)) / 100n;
+    const cashoutDisplay = await formatBalanceForDisplay(currentPayout, 'USD');
     const betDisplay = await formatBalanceForDisplay(session.bet_amount_lamports, 'USD');
-    let messageHTML = `<b>${emoji} ${escapeHTML(gameName)} ${emoji}</b>\n\n` +
-                      `Player: <b>${escapeHTML(gameState.p1Name)}</b>\n` +
-                      `Wager: <b>${escapeHTML(betDisplay)}</b>\n\n` +
-                      `Frame: <b>${gameState.turn} / ${maxTurns}</b>\n`;
 
-    // Show the outcome of the last roll
+    let messageHTML = `<b>${emoji} ${escape(gameName)} ${emoji}</b>\n\n` +
+                      `Player: <b>${escape(gameState.p1Name)}</b>\n` +
+                      `Wager: <b>${escape(betDisplay)}</b>\n\n` +
+                      `Turn: <b>${gameState.turn} / ${maxTurns}</b>\n`;
+
     if (gameState.lastRollValue) {
         const lastRollEffect = effects[gameState.lastRollValue];
         messageHTML += `Last Roll: <b>${gameState.lastRollValue} (${lastRollEffect.outcome})</b>\n`;
     }
-
     messageHTML += `Current Multiplier: <b>x${gameState.currentMultiplier.toFixed(2)}</b>\n\n`;
-
+    
     let callToAction = `Your move. Send ${emoji} to play.`;
     const keyboard = { inline_keyboard: [] };
     
-    // Logic for the cash-out button and call to action text
     if (gameState.turn > 1 && gameState.currentMultiplier > 0) {
-        const currentPayout = BigInt(session.bet_amount_lamports) * BigInt(Math.floor(gameState.currentMultiplier * 100)) / 100n;
-        const cashoutDisplay = await formatBalanceForDisplay(currentPayout, 'USD');
-        
         const lastRollEffect = effects[gameState.lastRollValue];
-        // If the last roll forces another turn (e.g., multiplier is < 1)
         if (lastRollEffect.multiplier_increase < 1.0) {
-             callToAction = `Your multiplier dropped! You must roll again to improve your score.`;
-             // We still show the cashout button as per your request
+             callToAction = `Your multiplier dropped! You can cash out for a partial return or risk it all.`;
              keyboard.inline_keyboard.push([{ text: `💰 Cash Out & Cut Losses (${cashoutDisplay})`, callback_data: `interactive_cashout:${session.session_id}` }]);
         } else {
-            callToAction = `Your move. Roll the next frame or take the cash.`;
+            callToAction = `Your move. Roll the next turn or take the cash.`;
             keyboard.inline_keyboard.push([{ text: `💰 Cash Out (${cashoutDisplay})`, callback_data: `interactive_cashout:${session.session_id}` }]);
         }
     }
-    
     messageHTML += callToAction;
 
     const sentMsg = await queuedSendMessage(session.chat_id, messageHTML, { parse_mode: 'HTML', reply_markup: keyboard });
     
-    // Save the new message ID and set a timeout for the player's turn
     if (sentMsg) {
         gameState.lastMessageId = sentMsg.message_id;
-        if(activeTurnTimeouts.has(session.session_id)) {
+        await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
+        
+        if (activeTurnTimeouts.has(session.session_id)) {
             clearTimeout(activeTurnTimeouts.get(session.session_id));
         }
         const timeoutId = setTimeout(() => handleGameTimeout(session.session_id), PLAYER_ACTION_TIMEOUT);
         activeTurnTimeouts.set(session.session_id, timeoutId);
-        await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
     }
 }
-
-// --- End of REPLACEMENT for promptPressYourLuckAction ---
 
 async function advancePvPGameState(sessionId) {
     const logPrefix = `[AdvancePvP SID:${sessionId}]`;
@@ -380,9 +365,11 @@ async function finalizeGame(session, finalStatus) {
             else if (p2Score > p1Score) dbStatus = 'completed_p2_win';
             else dbStatus = 'completed_push';
         } else if (finalStatus === 'completed_cashout') {
+            dbStatus = 'completed_cashout';
             const multiplier = gameState.currentMultiplier || 0;
             finalPayout = (BigInt(liveSession.bet_amount_lamports) * BigInt(Math.floor(multiplier * 100))) / 100n;
         } else if (finalStatus === 'completed_loss' || finalStatus === 'completed_timeout' || finalStatus === 'error') {
+            dbStatus = 'completed_loss';
             finalPayout = 0n;
         }
 
@@ -440,8 +427,11 @@ async function handleNotification(msg) {
         if (msg.channel === 'game_session_pickup') {
             await handleGameStart(session);
         } else if (msg.channel === 'interactive_roll_submitted') {
-            const { lastRoll } = (await pool.query("SELECT game_state_json FROM interactive_game_sessions WHERE session_id = $1", [session.session_id])).rows[0].game_state_json;
-            await handleRollSubmitted(session, lastRoll);
+            const res = await pool.query("SELECT game_state_json FROM interactive_game_sessions WHERE session_id = $1", [session.session_id]);
+            if (res.rows.length > 0) {
+                 const { lastRoll } = res.rows[0].game_state_json;
+                 await handleRollSubmitted(session, lastRoll);
+            }
         }
     } catch (e) { console.error('[Helper] Error processing notification payload:', e); }
 }
@@ -476,7 +466,9 @@ async function processPendingGames() {
 }
 processPendingGames.isRunning = false;
 
+// ===================================================================
 // --- UTILITY FUNCTIONS ---
+// ===================================================================
 
 function stringifyWithBigInt(obj) { return JSON.stringify(obj, (key, value) => (typeof value === 'bigint' ? value.toString() + 'n' : value), 2); }
 async function fetchSolUsdPriceFromBinanceAPI() { try { const response = await axios.get('https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT', { timeout: 8000 }); if (response.data?.price) return parseFloat(response.data.price); throw new Error('Invalid price data from Binance API.'); } catch (error) { throw error; }}
@@ -485,7 +477,7 @@ async function getSolUsdPrice() { const cached = solPriceCache.get(SOL_PRICE_CAC
 function convertLamportsToUSDString(lamports, solUsdPrice, d = 2) { if (typeof solUsdPrice !== 'number' || solUsdPrice <= 0) return 'N/A'; const sol = Number(BigInt(lamports)) / Number(LAMPORTS_PER_SOL); return `$${(sol * solUsdPrice).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d })}`;}
 async function formatBalanceForDisplay(lamports, currency = 'USD') { if (currency === 'USD') { try { const price = await getSolUsdPrice(); return convertLamportsToUSDString(lamports, price); } catch (e) { return 'N/A'; } } return `${(Number(BigInt(lamports)) / Number(LAMPORTS_PER_SOL)).toFixed(SOL_DECIMALS)} SOL`;}
 function getPressYourLuckConfig(gameType) { switch(gameType) { case 'bowling': return { maxTurns: BOWLING_FRAMES, effects: KINGPIN_ROLL_EFFECTS, emoji: '🎳' }; case 'darts': return { maxTurns: DARTS_THROWS_TOTAL, effects: BULLSEYE_BLITZ_EFFECTS, emoji: '🎯' }; case 'basketball': return { maxTurns: BASKETBALL_SHOTS_TOTAL, effects: DOWNTOWN_SHOOTOUT_EFFECTS, emoji: '🏀' }; default: return { maxTurns: 1, effects: {}, emoji: '🎲' }; }}
-function getShotsPerPlayer(gameType) { if (gameType.includes('bowling_duel_pvp')) return PVP_BOWLING_FRAMES; if (gameType.includes('basketball_clash_pvp')) return PVP_BASKETBALL_SHOTS; if (gameType.includes('darts_duel_pvp')) return PVP_DARTS_THROWS; return 1; }
+function getShotsPerPlayer(gameType) { const lt = String(gameType).toLowerCase(); if (lt.includes('bowling_duel_pvp')) return PVP_BOWLING_FRAMES; if (lt.includes('basketball_clash_pvp')) return PVP_BASKETBALL_SHOTS; if (lt.includes('darts_duel_pvp')) return PVP_DARTS_THROWS; if (lt === 'bowling') return BOWLING_FRAMES; if (lt === 'basketball') return BASKETBALL_SHOTS_TOTAL; if (lt === 'darts') return DARTS_THROWS_TOTAL; return 1; }
 function calculateFinalScore(gameType, rolls) { const safeRolls = rolls || []; if (safeRolls.length === 0) return 0; if (gameType.includes('basketball')) return safeRolls.filter(r => r >= 4).length; return safeRolls.reduce((a, b) => a + b, 0); }
 function getCleanGameNameHelper(gameType) { if (!gameType) return "Game"; const lt = String(gameType).toLowerCase(); if (lt.includes('bowling_duel_pvp')) return "Bowling Duel"; if (lt.includes('darts_duel_pvp')) return "Darts Showdown"; if (lt.includes('basketball_clash_pvp')) return "3-Point Clash"; if (lt === 'bowling') return "Kingpin's Challenge"; if (lt === 'darts') return "Bullseye Blitz"; if (lt === 'basketball') return "Downtown Shootout"; return "Game"; }
 function getGameEmoji(gameType) { if (gameType.includes('bowling')) return '🎳'; if (gameType.includes('darts')) return '🎯'; if (gameType.includes('basketball')) return '🏀'; return '🎲'; }
