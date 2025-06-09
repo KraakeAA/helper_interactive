@@ -74,7 +74,7 @@ bot.on('polling_error', (error) => console.error(`[Helper] Polling Error: ${erro
 const telegramSendQueue = new PQueue({ concurrency: 1, interval: 1000 / 20, intervalCap: 1 });
 const queuedSendMessage = (...args) => telegramSendQueue.add(() => bot.sendMessage(...args));
 
-// --- Start of NEW "Simple Hoops" Game Logic (for Helper Bot) ---
+// --- Start of REVISED "Simple Hoops" Game Logic (Streamlined Flow) ---
 
 // --- Simple Hoops Game Constants ---
 const SIMPLE_HOOPS_ROUNDS = 5;
@@ -83,30 +83,30 @@ const SIMPLE_HOOPS_INSTANT_LOSS_ROLLS = [1, 2];
 const SIMPLE_HOOPS_SUCCESS_ROLLS = [5, 6];
 const SIMPLE_HOOPS_CASHOUT_MULTIPLIER = 0.5; // Player gets 50% of their bet back
 const SIMPLE_HOOPS_PAYOUTS = {
-    // Payout multipliers for winning on each round (DOES NOT include original stake)
-    1: 0.2, // Round 1 win = 1.2x total return
-    2: 0.5, // Round 2 win = 1.5x total return
-    3: 1.0, // Round 3 win = 2.0x total return
-    4: 2.0, // Round 4 win = 3.0x total return
-    5: 4.0  // Round 5 win = 5.0x total return (Grand Prize)
+    // Payout multipliers for WINNING and MOVING PAST a round (does NOT include original stake)
+    1: 0.2, // Cleared Round 1
+    2: 0.5, // Cleared Round 2
+    3: 1.0, // Cleared Round 3
+    4: 2.0, // Cleared Round 4
+    5: 4.0  // Cleared Round 5 (Grand Prize, total 5x return)
 };
 
 /**
- * Entry point for the Simple Hoops game when picked up by the helper.
+ * Entry point and state initializer for the Simple Hoops game.
  * @param {object} session The game session data from the database.
  */
 async function runSimpleHoopsGame(session) {
-    const logPrefix = `[RunSimpleHoops SID:${session.session_id}]`;
-    console.log(`${logPrefix} Starting Simple Hoops game logic.`);
+    const logPrefix = `[RunSimpleHoops_V2 SID:${session.session_id}]`;
+    console.log(`${logPrefix} Starting streamlined Simple Hoops logic.`);
     let client = null;
     try {
         client = await pool.connect();
         const gameState = session.game_state_json || {};
         
-        // Initialize game state for the first time
         gameState.currentRound = 1;
         gameState.shotsTakenInRound = 0;
-        gameState.status = 'awaiting_shot';
+        gameState.currentRoundRolls = [];
+        gameState.status = 'awaiting_shots'; // New status for waiting for 2 rolls
 
         await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
         
@@ -121,13 +121,11 @@ async function runSimpleHoopsGame(session) {
 }
 
 /**
- * Creates and updates the single game message for Simple Hoops.
+ * Creates and updates the single game message for the new Simple Hoops flow.
  * @param {number} sessionId The database ID of the session.
  */
-// in helper_bot.js - REPLACE this entire function
-
 async function updateSimpleHoopsMessageHelper(sessionId) {
-    const logPrefix = `[UpdateSimpleHoopsMsg SID:${sessionId}]`;
+    const logPrefix = `[UpdateSimpleHoopsMsg_V2 SID:${sessionId}]`;
     let client = null;
     try {
         client = await pool.connect();
@@ -158,9 +156,9 @@ async function updateSimpleHoopsMessageHelper(sessionId) {
         }
         bodyHTML += `Progress: ${progressIcons}\nRound: <b>${gameState.currentRound} / ${SIMPLE_HOOPS_ROUNDS}</b>\n\n`;
 
-        if (gameState.status === 'awaiting_shot') {
-            // --- THIS IS THE FIX: Changed 🎲 to 🏀 ---
-            promptHTML = `It's your turn! Send 🏀 to take your shot (${gameState.shotsTakenInRound + 1}/${SIMPLE_HOOPS_SHOTS_PER_ROUND}).`;
+        if (gameState.status === 'awaiting_shots') {
+            const shotsRemaining = SIMPLE_HOOPS_SHOTS_PER_ROUND - (gameState.currentRoundRolls?.length || 0);
+            promptHTML = `Please send <b>${shotsRemaining}</b> more 🏀 emoji(s) to take your shot(s) for this round.`;
         } else if (gameState.status === 'round_failed_cashout_prompt') {
             const cashoutValue = BigInt(session.bet_amount_lamports) * BigInt(Math.floor(SIMPLE_HOOPS_CASHOUT_MULTIPLIER * 100)) / 100n;
             const cashoutDisplay = await formatBalanceForDisplay(cashoutValue, 'USD');
@@ -177,7 +175,7 @@ async function updateSimpleHoopsMessageHelper(sessionId) {
         if (sentMsg) {
             gameState.lastMessageId = sentMsg.message_id;
             await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), sessionId]);
-            const timeoutId = setTimeout(() => finalizeGame({ session_id: sessionId }, 'completed_timeout'), PLAYER_ACTION_TIMEOUT);
+            const timeoutId = setTimeout(() => finalizeGame({ session_id: sessionId }, 'completed_timeout'), PLAYER_ACTION_TIMEOUT * 2); // Longer timeout for 2 rolls
             activeTurnTimeouts.set(sessionId, timeoutId);
         }
     } catch (e) {
@@ -193,43 +191,45 @@ async function updateSimpleHoopsMessageHelper(sessionId) {
  * @param {number} rollValue The value of the dice roll.
  */
 async function handleSimpleHoopsRollHelper(session, rollValue) {
-    const logPrefix = `[HandleSimpleHoopsRoll SID:${session.session_id}]`;
+    const logPrefix = `[HandleSimpleHoopsRoll_V2 SID:${session.session_id}]`;
     const gameState = session.game_state_json;
-    gameState.shotsTakenInRound++;
 
-    const playerRefHTML = escape(gameState.p1Name);
+    if (gameState.status !== 'awaiting_shots') return;
 
     // 1. Check for instant loss
     if (SIMPLE_HOOPS_INSTANT_LOSS_ROLLS.includes(rollValue)) {
-        await queuedSendMessage(session.chat_id, `🏀 ${playerRefHTML} shoots... It's an AIRBALL! 🏀\nA roll of <b>${rollValue}</b> is an instant loss.`, { parse_mode: 'HTML' });
-        await finalizeGame(session, 'completed_loss');
+        await queuedSendMessage(session.chat_id, `🏀 ${escape(gameState.p1Name)} shoots... It's an AIRBALL! 🏀\nA roll of <b>${rollValue}</b> is an instant loss.`, { parse_mode: 'HTML' });
+        await finalizeGame(session, 'bust');
         return;
     }
 
-    // 2. Check for success
-    if (SIMPLE_HOOPS_SUCCESS_ROLLS.includes(rollValue)) {
-        if (gameState.currentRound >= SIMPLE_HOOPS_ROUNDS) {
-            await queuedSendMessage(session.chat_id, `🏀 ${playerRefHTML} shoots... SWISH! 🏀\nYou've cleared the final round! Calculating your grand prize!`, { parse_mode: 'HTML' });
-            await finalizeGame(session, 'completed_win');
-        } else {
-            await queuedSendMessage(session.chat_id, `🏀 ${playerRefHTML} shoots... SWISH! 🏀\nRound ${gameState.currentRound} cleared! Moving to the next...`, { parse_mode: 'HTML' });
-            gameState.currentRound++;
-            gameState.shotsTakenInRound = 0;
+    // 2. Add roll to the current round's shots
+    if (!gameState.currentRoundRolls) {
+        gameState.currentRoundRolls = [];
+    }
+    gameState.currentRoundRolls.push(rollValue);
+
+    // 3. Check if the round is complete
+    if (gameState.currentRoundRolls.length >= SIMPLE_HOOPS_SHOTS_PER_ROUND) {
+        const roundSuccess = gameState.currentRoundRolls.some(roll => SIMPLE_HOOPS_SUCCESS_ROLLS.includes(roll));
+
+        if (roundSuccess) {
+            if (gameState.currentRound >= SIMPLE_HOOPS_ROUNDS) {
+                await finalizeGame(session, 'win');
+            } else {
+                gameState.currentRound++;
+                gameState.currentRoundRolls = [];
+                await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
+                await updateSimpleHoopsMessageHelper(session.session_id);
+            }
+        } else { // Round failed (both were misses)
+            gameState.status = 'round_failed_cashout_prompt';
             await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
             await updateSimpleHoopsMessageHelper(session.session_id);
         }
-        return;
-    }
-
-    // 3. Handle a miss (Rolls 3 or 4)
-    if (gameState.shotsTakenInRound < SIMPLE_HOOPS_SHOTS_PER_ROUND) {
-        await queuedSendMessage(session.chat_id, `🏀 ${playerRefHTML} shoots... it rims out! 🏀\nYou have one more shot this round.`, { parse_mode: 'HTML' });
-        await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
-        await updateSimpleHoopsMessageHelper(session.session_id);
     } else {
-        gameState.status = 'round_failed_cashout_prompt';
+        // Silently wait for the next roll
         await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
-        await updateSimpleHoopsMessageHelper(session.session_id);
     }
 }
 
@@ -241,28 +241,6 @@ async function handleSimpleHoopsCashoutHelper(sessionId) {
     const session = (await pool.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [sessionId])).rows[0];
     if (session && session.game_state_json.status === 'round_failed_cashout_prompt') {
         await finalizeGame(session, 'completed_cashout');
-    }
-}
-
-/**
- * Handles the "Continue" button press.
- * @param {number} sessionId The database ID of the session.
- */
-async function handleSimpleHoopsContinueHelper(sessionId) {
-    const client = await pool.connect();
-    try {
-        const res = await client.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [sessionId]);
-        if (res.rowCount > 0 && res.rows[0].game_state_json.status === 'round_failed_cashout_prompt') {
-            const session = res.rows[0];
-            const gameState = session.game_state_json;
-            gameState.currentRound++;
-            gameState.shotsTakenInRound = 0;
-            gameState.status = 'awaiting_shot';
-            await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), sessionId]);
-            await updateSimpleHoopsMessageHelper(sessionId);
-        }
-    } finally {
-        client.release();
     }
 }
 
@@ -547,17 +525,18 @@ async function finalizeGame(session, finalStatus) {
         // --- ADD THIS BLOCK ---
         if (session.game_type === 'basketball') {
             if (finalStatus === 'completed_win') {
+                dbStatus = 'completed_win';
                 const multiplier = SIMPLE_HOOPS_PAYOUTS[gameState.currentRound] || 0;
-                const profit = BigInt(session.bet_amount_lamports) * BigInt(Math.floor(multiplier * 100)) / 100n;
-                finalPayout = BigInt(session.bet_amount_lamports) + profit;
+                const profit = BigInt(liveSession.bet_amount_lamports) * BigInt(Math.floor(multiplier * 100)) / 100n;
+                finalPayout = BigInt(liveSession.bet_amount_lamports) + profit;
             } else if (finalStatus === 'completed_cashout') {
-                finalPayout = BigInt(session.bet_amount_lamports) * BigInt(Math.floor(SIMPLE_HOOPS_CASHOUT_MULTIPLIER * 100)) / 100n;
-            } else { // loss or timeout
-                dbStatus = 'completed_loss'; // Standardize final loss status
+                dbStatus = 'completed_cashout';
+                finalPayout = BigInt(liveSession.bet_amount_lamports) * BigInt(Math.floor(SIMPLE_HOOPS_CASHOUT_MULTIPLIER * 100)) / 100n;
+            } else { // bust, timeout, loss_final_round
+                dbStatus = 'completed_loss';
                 finalPayout = 0n;
             }
-            // Overwrite finalStatus for DB consistency
-            gameState.finalStatus = dbStatus;
+            gameState.finalStatus = dbStatus; // Store final status in JSON
         } 
         // --- END OF ADDED BLOCK ---
         else if (finalStatus === 'pvp_resolve') {
