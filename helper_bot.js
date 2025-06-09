@@ -309,30 +309,36 @@ function formatRollsHelper(rolls) {
 async function processPendingGames() {
     if (processPendingGames.isRunning) return;
     processPendingGames.isRunning = true;
-    const logPrefix = '[Helper] Game Poller';
+    const logPrefix = '[Helper] Fallback Poller V2';
     
     let client = null;
     try {
         client = await pool.connect();
         
-        // Poller now picks up ALL interactive game types that are pending
-        const pendingSessions = await client.query("SELECT * FROM interactive_game_sessions WHERE status = 'pending_pickup' ORDER BY created_at ASC LIMIT 5 FOR UPDATE SKIP LOCKED");
+        // Find any game that is still pending pickup. Locking is not strictly necessary here
+        // because the listener's claiming mechanism is atomic, but it doesn't hurt.
+        const pendingSessions = await client.query(
+            "SELECT * FROM interactive_game_sessions WHERE status = 'pending_pickup' ORDER BY created_at ASC LIMIT 5"
+        );
 
-        for (const session of pendingSessions.rows) {
-            console.log(`${logPrefix} Picked up session ${session.session_id} (Type: ${session.game_type})`);
-            await client.query("UPDATE interactive_game_sessions SET status = 'in_progress', helper_bot_id = $1 WHERE session_id = $2", [MY_BOT_ID, session.session_id]);
-            
-            // This notification is a fallback in case the main bot's initial notification was missed
-            await client.query(`NOTIFY game_session_pickup, '${JSON.stringify({ session: session })}'`);
+        if (pendingSessions.rowCount > 0) {
+            console.log(`${logPrefix} Found ${pendingSessions.rowCount} potentially missed session(s). Re-triggering notification.`);
+            for (const session of pendingSessions.rows) {
+                // Simply notify the listener channel and let it handle the claiming.
+                // This centralizes the logic and prevents race conditions.
+                await client.query(`NOTIFY game_session_pickup, '${JSON.stringify({ session: session })}'`);
+            }
         }
     } catch (e) {
-        console.error(`${logPrefix} Error in processing loop: ${e.message}`);
+        console.error(`${logPrefix} Error in fallback processing loop: ${e.message}`);
     } finally {
         if (client) client.release();
         processPendingGames.isRunning = false;
     }
 }
-processPendingGames.isRunning = false;
+processPendingGames.isRunning = false; // Initialize the flag
+
+// --- End of REPLACEMENT for processPendingGames ---
 
 async function setupNotificationListeners() {
     console.log("⚙️ [Helper] Setting up notification listeners...");
