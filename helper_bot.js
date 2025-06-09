@@ -1,4 +1,4 @@
-// helper_bot.js - FINAL UNIFIED VERSION v7 - All-in-One, All Fixes Included
+// helper_bot.js - FINAL UNIFIED VERSION v9 - All Game Logic Restored, No Omissions
 
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
@@ -17,7 +17,7 @@ const PLAYER_ACTION_TIMEOUT = 90000;
 // --- Basic Utilities ---
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// --- Price Fetching Dependencies ---
+// --- Price Fetching & Formatting Dependencies ---
 const SOL_DECIMALS = 9;
 const solPriceCache = new Map();
 const SOL_PRICE_CACHE_KEY = 'sol_usd_price_cache';
@@ -57,6 +57,10 @@ const DOWNTOWN_SHOOTOUT_EFFECTS = {
 const PVP_BOWLING_FRAMES = 3;
 const PVP_BASKETBALL_SHOTS = 5;
 const PVP_DARTS_THROWS = 3;
+const THREE_POINT_PAYOUTS = [1.5, 2.2, 3.5, 5.0, 10.0, 20.0, 50.0];
+const PINPOINT_BOWLING_PAYOUT_MULTIPLIER = 5.5;
+const DARTS_FORTUNE_PAYOUTS = { 6: 3.5, 5: 1.5, 4: 0.5, 3: 0.2, 2: 0.1, 1: 0.0 };
+
 
 // --- Database & Bot Setup ---
 if (!HELPER_BOT_TOKEN || !DATABASE_URL) {
@@ -69,6 +73,7 @@ const bot = new TelegramBot(HELPER_BOT_TOKEN, { polling: { params: { allowed_upd
 bot.on('polling_error', (error) => console.error(`[Helper] Polling Error: ${error.code} - ${error.message}`));
 const telegramSendQueue = new PQueue({ concurrency: 1, interval: 1000 / 20, intervalCap: 1 });
 const queuedSendMessage = (...args) => telegramSendQueue.add(() => bot.sendMessage(...args));
+
 
 // ===================================================================
 // --- GAME ENGINE & STATE MACHINE ---
@@ -89,13 +94,17 @@ async function handleGameStart(session) {
         
         const liveSession = updateRes.rows[0];
         const gameState = liveSession.game_state_json || {};
-        const isPressYourLuck = ['bowling', 'darts', 'basketball'].includes(liveSession.game_type);
+        const gameType = liveSession.game_type;
         
-        if (isPressYourLuck) {
+        // This acts as a router for different game types
+        const isNewPressYourLuck = ['bowling', 'darts', 'basketball'].includes(gameType) && !gameType.includes('_pvp');
+        const isNewPvPDuel = gameType.includes('_pvp');
+
+        if (isNewPressYourLuck) {
              gameState.turn = 1;
              gameState.rolls = [];
              gameState.currentMultiplier = 1.0;
-        } else {
+        } else if (isNewPvPDuel) {
             gameState.p1Rolls = []; gameState.p1Score = 0;
             gameState.p2Rolls = []; gameState.p2Score = 0;
         }
@@ -108,10 +117,14 @@ async function handleGameStart(session) {
         await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), liveSession.session_id]);
         await client.query('COMMIT');
 
-        if (isPressYourLuck) {
+        // Route to the correct game logic
+        if (isNewPressYourLuck) {
             await runPressYourLuckGame(liveSession.session_id);
-        } else {
+        } else if (isNewPvPDuel) {
             await advancePvPGameState(liveSession.session_id);
+        } else {
+            console.error(`${logPrefix} Unhandled game type for new engine: ${gameType}`);
+            await finalizeGame(liveSession, 'error');
         }
     } catch (e) {
         if (client) await client.query('ROLLBACK');
@@ -155,7 +168,6 @@ async function runPressYourLuckGame(sessionId) {
 async function promptPressYourLuckAction(session) {
     const gameState = session.game_state_json;
     const gameType = session.game_type;
-
     if (gameState.lastMessageId) {
         await bot.deleteMessage(session.chat_id, gameState.lastMessageId).catch(() => {});
     }
@@ -168,15 +180,15 @@ async function promptPressYourLuckAction(session) {
     const betDisplay = await formatBalanceForDisplay(session.bet_amount_lamports, 'USD');
 
     let messageHTML = `<b>${emoji} ${escape(gameName)} ${emoji}</b>\n\n` +
-                      `Player: <b>${escape(gameState.p1Name)}</b>\n` +
-                      `Wager: <b>${escape(betDisplay)}</b>\n\n` +
-                      `Turn: <b>${gameState.turn} / ${maxTurns}</b>\n`;
+                      `Player: <b>${escape(gameState.p1Name)}</b> | Wager: <b>${escape(betDisplay)}</b>\n` +
+                      `Current Multiplier: <b>x${gameState.currentMultiplier.toFixed(2)}</b>\n\n`;
 
     if (gameState.lastRollValue) {
         const lastRollEffect = effects[gameState.lastRollValue];
         messageHTML += `Last Roll: <b>${gameState.lastRollValue} (${lastRollEffect.outcome})</b>\n`;
     }
-    messageHTML += `Current Multiplier: <b>x${gameState.currentMultiplier.toFixed(2)}</b>\n\n`;
+    
+    messageHTML += `Turn: <b>${gameState.turn} / ${maxTurns}</b>\n\n`;
     
     let callToAction = `Your move. Send ${emoji} to play.`;
     const keyboard = { inline_keyboard: [] };
@@ -191,7 +203,7 @@ async function promptPressYourLuckAction(session) {
             keyboard.inline_keyboard.push([{ text: `💰 Cash Out (${cashoutDisplay})`, callback_data: `interactive_cashout:${session.session_id}` }]);
         }
     }
-    messageHTML += callToAction;
+    messageHTML += `<i>${callToAction}</i>`;
 
     const sentMsg = await queuedSendMessage(session.chat_id, messageHTML, { parse_mode: 'HTML', reply_markup: keyboard });
     
@@ -199,9 +211,7 @@ async function promptPressYourLuckAction(session) {
         gameState.lastMessageId = sentMsg.message_id;
         await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
         
-        if (activeTurnTimeouts.has(session.session_id)) {
-            clearTimeout(activeTurnTimeouts.get(session.session_id));
-        }
+        if (activeTurnTimeouts.has(session.session_id)) clearTimeout(activeTurnTimeouts.get(session.session_id));
         const timeoutId = setTimeout(() => handleGameTimeout(session.session_id), PLAYER_ACTION_TIMEOUT);
         activeTurnTimeouts.set(session.session_id, timeoutId);
     }
@@ -338,17 +348,18 @@ async function handleRollSubmitted(session, lastRoll) {
 }
 
 async function finalizeGame(session, finalStatus) {
-    const logPrefix = `[FinalizeGame SID:${session.session_id}]`;
-    const timeoutId = activeTurnTimeouts.get(session.session_id);
+    const sessionId = session.session_id;
+    const logPrefix = `[FinalizeGame SID:${sessionId}]`;
+    const timeoutId = activeTurnTimeouts.get(sessionId);
     if (timeoutId) {
         clearTimeout(timeoutId);
-        activeTurnTimeouts.delete(session.session_id);
+        activeTurnTimeouts.delete(sessionId);
     }
     let client = null;
     try {
         client = await pool.connect();
         await client.query('BEGIN');
-        const liveSessionRes = await client.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1 FOR UPDATE", [session.session_id]);
+        const liveSessionRes = await client.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1 FOR UPDATE", [sessionId]);
         if(liveSessionRes.rowCount === 0) { await client.query('ROLLBACK'); return; }
         
         const liveSession = liveSessionRes.rows[0];
@@ -375,9 +386,9 @@ async function finalizeGame(session, finalStatus) {
 
         await client.query(
             "UPDATE interactive_game_sessions SET status = $1, final_payout_lamports = $2, game_state_json = $3 WHERE session_id = $4",
-            [dbStatus, finalPayout.toString(), JSON.stringify(gameState), liveSession.session_id]
+            [dbStatus, finalPayout.toString(), JSON.stringify(gameState), sessionId]
         );
-        await client.query(`NOTIFY game_completed, '${JSON.stringify({ session_id: liveSession.session_id })}'`);
+        await client.query(`NOTIFY game_completed, '${JSON.stringify({ session_id: sessionId })}'`);
         await client.query('COMMIT');
         
         if(gameState.lastMessageId) {
@@ -391,22 +402,22 @@ async function finalizeGame(session, finalStatus) {
     }
 }
 
+// ===================================================================
+// --- EVENT HANDLERS & MAIN LOOP ---
+// ===================================================================
+
 bot.on('callback_query', async (callbackQuery) => {
     const data = callbackQuery.data;
-    if (!data || !data.startsWith('interactive_cashout:')) return;
-    await bot.answerCallbackQuery(callbackQuery.id, { text: "Cashing out..." }).catch(() => {});
-    
-    const sessionId = data.split(':')[1];
-    const sessionRes = await pool.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [sessionId]);
-    if (sessionRes.rowCount > 0 && sessionRes.rows[0].status === 'in_progress') {
-        const session = sessionRes.rows[0];
-        if(String(session.user_id) !== String(callbackQuery.from.id)) return;
-        const timeoutId = activeTurnTimeouts.get(session.session_id);
-        if (timeoutId) {
-            clearTimeout(timeoutId);
-            activeTurnTimeouts.delete(session.session_id);
+    if (data && data.startsWith('interactive_cashout:')) {
+        await bot.answerCallbackQuery(callbackQuery.id, { text: "Cashing out..." }).catch(() => {});
+        const sessionId = data.split(':')[1];
+        const res = await pool.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [sessionId]);
+        if (res.rowCount > 0 && res.rows[0].status === 'in_progress') {
+            const session = res.rows[0];
+            if(String(session.user_id) !== String(callbackQuery.from.id)) return;
+            await finalizeGame(session, 'completed_cashout');
         }
-        await finalizeGame(session, 'completed_cashout');
+        return;
     }
 });
 
