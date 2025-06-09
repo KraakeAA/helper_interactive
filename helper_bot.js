@@ -595,12 +595,10 @@ bot.on('callback_query', async (callbackQuery) => {
     if (!data) return;
 
     // --- ADD THIS BLOCK ---
-    if (data.startsWith('simple_hoops_')) {
+    if (data.startsWith('simple_hoops_cashout:')) {
         await bot.answerCallbackQuery(callbackQuery.id).catch(() => {});
-        const [action, sessionId] = data.split(':');
-        if (action === 'simple_hoops_cashout') {
-            await handleSimpleHoopsCashoutHelper(sessionId);
-        }
+        const sessionId = data.split(':')[1];
+        await handleSimpleHoopsCashoutHelper(sessionId);
         return;
     }
     // --- END OF ADDED BLOCK ---
