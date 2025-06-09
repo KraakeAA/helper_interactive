@@ -45,34 +45,60 @@ const queuedSendMessage = (...args) => telegramSendQueue.add(() => bot.sendMessa
 // This engine handles all new interactive games.
 // ===================================================================
 
-/**
- * Called when a new game session is picked up. Initializes the game state.
- */
+// --- Start of REPLACEMENT for handleGameStart in helper_bot.js ---
+
 async function handleGameStart(session) {
-    const logPrefix = `[HandleStart SID:${session.session_id}]`;
+    const logPrefix = `[HandleStart_V2 SID:${session.session_id}]`;
     console.log(`${logPrefix} Initializing new interactive game: ${session.game_type}`);
-    const gameState = session.game_state_json || {};
+    let client = null;
 
-    // Initialize player 1 (initiator)
-    gameState.p1Rolls = [];
-    gameState.p1Score = 0;
-    gameState.p1Name = gameState.initiatorName || "Player 1";
-    
-    // Set the first turn
-    gameState.currentPlayerTurn = String(gameState.initiatorId || session.user_id);
-    gameState.currentTurnStartTime = Date.now();
+    try {
+        client = await pool.connect();
+        await client.query('BEGIN');
 
-    // Initialize player 2 if it's a PvP match
-    if (gameState.gameMode === 'pvp') {
-        gameState.p2Rolls = [];
-        gameState.p2Score = 0;
-        gameState.p2Name = gameState.opponentName || "Player 2";
+        // --- THIS IS THE FIX ---
+        // First, officially claim the session by setting its status to 'in_progress'.
+        const updateRes = await client.query(
+            "UPDATE interactive_game_sessions SET status = 'in_progress', helper_bot_id = $1 WHERE session_id = $2 AND status = 'pending_pickup' RETURNING *",
+            [MY_BOT_ID, session.session_id]
+        );
+
+        // If another helper bot instance claimed it in a race condition, abort.
+        if (updateRes.rowCount === 0) {
+            console.log(`${logPrefix} Session was already claimed by another process. Aborting.`);
+            await client.query('ROLLBACK');
+            return;
+        }
+        
+        const liveSession = updateRes.rows[0];
+        const gameState = liveSession.game_state_json || {};
+        
+        // Initialize game state properties
+        gameState.p1Rolls = [];
+        gameState.p1Score = 0;
+        gameState.currentPlayerTurn = String(gameState.initiatorId || liveSession.user_id);
+        gameState.currentTurnStartTime = Date.now();
+
+        if (gameState.gameMode === 'pvp') {
+            gameState.p2Rolls = [];
+            gameState.p2Score = 0;
+        }
+        
+        await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), liveSession.session_id]);
+        await client.query('COMMIT');
+
+        // Now that state is saved, advance the game (which sends the first prompt)
+        await advanceGameState(liveSession.session_id);
+
+    } catch (e) {
+        if (client) await client.query('ROLLBACK');
+        console.error(`${logPrefix} Error initializing game: ${e.message}`);
+    } finally {
+        if (client) client.release();
     }
-    
-    await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
-    await advanceGameState(session.session_id);
 }
 
+// --- End of REPLACEMENT for handleGameStart ---
 /**
  * Called when the main bot notifies that a user has rolled the dice.
  */
