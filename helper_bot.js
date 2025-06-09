@@ -1,4 +1,4 @@
-// helper_bot.js - FINAL VERSION with All New Game Modes
+// helper_bot.js - FINAL VERSION with Turn-Based PvP/PvB and Original Game Logic
 
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
@@ -9,18 +9,19 @@ import PQueue from 'p-queue';
 const HELPER_BOT_TOKEN = process.env.HELPER_BOT_TOKEN;
 const DATABASE_URL = process.env.DATABASE_URL;
 const MY_BOT_ID = process.env.HELPER_BOT_ID || 'HelperBot_1';
-const GAME_LOOP_INTERVAL = 2500;
-const PLAYER_CHOICE_TIMEOUT = 60000;
+const GAME_LOOP_INTERVAL = 5000; // Fallback poller for original games
+const PLAYER_CHOICE_TIMEOUT = 60000; // For original interactive games
 
 // --- Basic Utilities ---
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 // --- Game Constants ---
 const THREE_POINT_PAYOUTS = [1.5, 2.2, 3.5, 5.0, 10.0, 20.0, 50.0];
-const PINPOINT_BOWLING_PAYOUT_MULTIPLIER = 5.5; // For the original prediction game
-const DARTS_FORTUNE_PAYOUTS = { 6: 3.5, 5: 1.5, 4: 0.5, 3: 0.2, 2: 0.1, 1: 0.0 }; // For the original darts game
+const PINPOINT_BOWLING_PAYOUT_MULTIPLIER = 5.5;
+const DARTS_FORTUNE_PAYOUTS = { 6: 3.5, 5: 1.5, 4: 0.5, 3: 0.2, 2: 0.1, 1: 0.0 };
 const BOWLING_FRAMES = 3;
 const BASKETBALL_SHOTS = 3;
+const DARTS_THROWS = 1;
 
 // --- Database & Bot Setup ---
 if (!HELPER_BOT_TOKEN || !DATABASE_URL) {
@@ -31,75 +32,207 @@ if (!HELPER_BOT_TOKEN || !DATABASE_URL) {
 const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
 const bot = new TelegramBot(HELPER_BOT_TOKEN, { polling: true });
 
-bot.on('polling_error', (error) => {
-    console.error(`[Helper] Polling Error: ${error.code} - ${error.message}`);
-});
+bot.on('polling_error', (error) => console.error(`[Helper] Polling Error: ${error.code} - ${error.message}`));
 
-const telegramSendQueue = new PQueue({ concurrency: 1, interval: 1000 / 25, intervalCap: 1 });
+const telegramSendQueue = new PQueue({ concurrency: 1, interval: 1000 / 20, intervalCap: 1 });
 const queuedSendMessage = (...args) => telegramSendQueue.add(() => bot.sendMessage(...args));
 
-
 // ===================================================================
-// --- CORE HELPER BOT LOGIC ---
+// --- NEW TURN-BASED GAME ENGINE ---
 // ===================================================================
 
-async function processInteractiveGames() {
-    if (processInteractiveGames.isRunning) return;
-    processInteractiveGames.isRunning = true;
+/**
+ * Triggered on new game session pickup. Initializes the game state.
+ * @param {object} session - The session object from the database.
+ */
+async function handleGameStart(session) {
+    const logPrefix = `[HandleStart SID:${session.session_id}]`;
+    console.log(`${logPrefix} Initializing new interactive game.`);
+    const gameState = session.game_state_json || {};
     
+    // Initialize game state
+    gameState.p1Rolls = [];
+    gameState.p1Score = 0;
+    gameState.currentPlayerTurn = gameState.initiatorId || session.user_id;
+    gameState.currentTurnNumber = 1;
+
+    if (gameState.gameMode === 'pvp') {
+        gameState.p2Rolls = [];
+        gameState.p2Score = 0;
+    }
+    
+    await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
+    await advanceGameState(session.session_id);
+}
+
+/**
+ * Triggered when a player's roll is submitted. It records the roll and advances the game state.
+ * @param {object} session - The full session object from the database.
+ */
+async function handleRollSubmitted(session) {
+    const logPrefix = `[HandleRoll SID:${session.session_id}]`;
     let client = null;
     try {
         client = await pool.connect();
-        const pendingSessions = await client.query("SELECT * FROM interactive_game_sessions WHERE status = 'pending_pickup' ORDER BY created_at ASC LIMIT 5 FOR UPDATE SKIP LOCKED");
+        const res = await client.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [session.session_id]);
+        if (res.rowCount === 0 || !res.rows[0].status.startsWith('in_progress')) return;
 
-        for (const session of pendingSessions.rows) {
-            console.log(`[Helper] Picked up session ${session.session_id} (Type: ${session.game_type})`);
-            await client.query("UPDATE interactive_game_sessions SET status = 'in_progress', helper_bot_id = $1 WHERE session_id = $2", [MY_BOT_ID, session.session_id]);
-            
-            // --- UPDATED GAME ROUTER ---
-            switch (session.game_type) {
-                // Original PvB Games
-                case 'bowling':
-                    await runOriginalPinpointBowling(session);
-                    break;
-                case 'darts':
-                    await runDartsFortune(session);
-                    break;
-                case 'basketball':
-                    await runThreePointShootout(session);
-                    break;
-                
-                // New Duel Games
-                case 'bowling_duel': // New PvB Three-Frame Showdown
-                    await runBowlingDuel(session);
-                    break;
-                case 'bowling_duel_pvp':
-                case 'darts_duel_pvp':
-                case 'basketball_clash_pvp':
-                    await runInteractivePvP(session);
-                    break;
-
-                default:
-                    console.error(`[Helper] Unknown game type in session ${session.session_id}: ${session.game_type}`);
-                    await client.query("UPDATE interactive_game_sessions SET status = 'archived_error' WHERE session_id = $1", [session.session_id]);
-            }
+        const liveSession = res.rows[0];
+        const gameState = liveSession.game_state_json || {};
+        const rollValue = gameState.lastRoll;
+        const currentPlayerId = gameState.currentPlayerTurn;
+        
+        if (!rollValue || !currentPlayerId) {
+            console.error(`${logPrefix} Missing roll value or current player in game state.`);
+            return;
         }
+
+        const playerKey = (gameState.initiatorId === currentPlayerId) ? 'p1' : 'p2';
+        
+        if (gameState[`${playerKey}Rolls`]) {
+            gameState[`${playerKey}Rolls`].push(rollValue);
+        } else {
+            gameState[`${playerKey}Rolls`] = [rollValue];
+        }
+
+        await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), liveSession.session_id]);
+        await advanceGameState(liveSession.session_id);
+
     } catch (e) {
-        console.error(`[Helper] Error in main processing loop: ${e.message}`);
+        console.error(`${logPrefix} Error handling submitted roll: ${e.message}`);
     } finally {
         if (client) client.release();
-        processInteractiveGames.isRunning = false;
     }
 }
-processInteractiveGames.isRunning = false;
 
+/**
+ * The main state machine. Checks the game's status and decides what to do next.
+ * @param {number} sessionId - The ID of the game session to process.
+ */
+async function advanceGameState(sessionId) {
+    const logPrefix = `[AdvanceState SID:${sessionId}]`;
+    let client = null;
+    try {
+        client = await pool.connect();
+        const res = await client.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [sessionId]);
+        if (res.rowCount === 0) return;
 
-// --- ORIGINAL PvB GAME LOGIC (KEPT AS IS) ---
+        const session = res.rows[0];
+        if (session.status !== 'in_progress') return;
+
+        const gameState = session.game_state_json || {};
+        const isPvP = gameState.gameMode === 'pvp';
+        const gameType = session.game_type;
+
+        const shotsPerPlayer = gameType.includes('bowling') ? BOWLING_FRAMES : gameType.includes('basketball') ? BASKETBALL_SHOTS : DARTS_THROWS;
+
+        const p1_done = gameState.p1Rolls.length >= shotsPerPlayer;
+        const p2_done_pvp = isPvP ? (gameState.p2Rolls.length >= shotsPerPlayer) : true;
+        
+        if (p1_done && p2_done_pvp) {
+            await finalizeGameSession(session, gameState);
+            return;
+        }
+
+        if (!p1_done) {
+            gameState.currentPlayerTurn = gameState.initiatorId;
+        } else if (isPvP && !p2_done_pvp) {
+            gameState.currentPlayerTurn = gameState.opponentId;
+        } else if (!isPvP && p1_done) { 
+            await runBotTurn(session, gameState);
+            return;
+        }
+
+        await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), sessionId]);
+        await promptNextPlayer(session, gameState);
+
+    } catch (e) {
+        console.error(`${logPrefix} Error advancing game state: ${e.message}`);
+    } finally {
+        if (client) client.release();
+    }
+}
+
+/**
+ * Sends a message to the chat prompting the correct player for their turn.
+ * @param {object} session - The game session object.
+ * @param {object} gameState - The current state of the game.
+ */
+async function promptNextPlayer(session, gameState) {
+    const { chat_id, game_type } = session;
+    const { p1Name, p2Name, p1Rolls, p2Rolls, currentPlayerTurn, initiatorId } = gameState;
+    
+    const gameName = getCleanGameNameHelper(game_type);
+    const emoji = getGameEmoji(game_type);
+    const shotsPerPlayer = game_type.includes('bowling') ? BOWLING_FRAMES : game_type.includes('basketball') ? BASKETBALL_SHOTS : DARTS_THROWS;
+    
+    const nextPlayerName = (currentPlayerTurn === initiatorId) ? p1Name : (p2Name || "Bot");
+    const nextPlayerRolls = (currentPlayerTurn === initiatorId) ? p1Rolls : p2Rolls;
+
+    let messageHTML = `⚔️ <b>${gameName}</b> ⚔️\n\n` +
+                      `<b>${p1Name}:</b> ${formatRollsHelper(p1Rolls)}\n` +
+                      `<b>${p2Name || 'Bot'}:</b> ${formatRollsHelper(p2Rolls || [])}\n\n` +
+                      `It's your turn, <b>${nextPlayerName}</b>! Send a ${emoji} to roll (Roll ${nextPlayerRolls.length + 1} of ${shotsPerPlayer}).`;
+                      
+    await queuedSendMessage(chat_id, messageHTML, { parse_mode: 'HTML' });
+}
+
+/**
+ * Handles the logic for the bot's turn in a PvB duel game.
+ * @param {object} session - The game session object.
+ * @param {object} gameState - The current state of the game.
+ */
+async function runBotTurn(session, gameState) {
+    const shotsPerPlayer = session.game_type.includes('bowling') ? BOWLING_FRAMES : 1;
+    let botRolls = [];
+    for (let i = 0; i < shotsPerPlayer; i++) {
+        botRolls.push(Math.floor(Math.random() * 6) + 1);
+    }
+    gameState.p2Rolls = botRolls;
+    await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
+    await finalizeGameSession(session, gameState);
+}
+
+/**
+ * Calculates final scores, determines the winner, and notifies the main bot.
+ * @param {object} session - The game session object.
+ * @param {object} gameState - The final state of the game.
+ */
+async function finalizeGameSession(session, gameState) {
+    const { game_type } = session;
+    let { p1Score, p2Score, p1Rolls, p2Rolls } = gameState;
+
+    const isBasketball = game_type.includes('basketball');
+    p1Score = isBasketball ? p1Rolls.filter(r => r >= 4).length : p1Rolls.reduce((a, b) => a + b, 0);
+    p2Score = isBasketball ? (p2Rolls || []).filter(r => r >= 4).length : (p2Rolls || []).reduce((a, b) => a + b, 0);
+
+    gameState.p1Score = p1Score;
+    gameState.p2Score = p2Score;
+    
+    let finalStatus;
+    let finalPayout = 0n;
+    const betAmount = BigInt(session.bet_amount_lamports);
+    
+    if (p1Score > p2Score) {
+        finalStatus = gameState.gameMode === 'pvp' ? 'completed_p1_win' : 'completed_win';
+        finalPayout = betAmount * 2n;
+    } else if (p2Score > p1Score) {
+        finalStatus = gameState.gameMode === 'pvp' ? 'completed_p2_win' : 'completed_loss';
+        finalPayout = 0n;
+    } else {
+        finalStatus = 'completed_push';
+        finalPayout = betAmount;
+    }
+
+    await pool.query("UPDATE interactive_game_sessions SET status = $1, final_payout_lamports = $2, game_state_json = $3 WHERE session_id = $4", [finalStatus, finalPayout.toString(), JSON.stringify(gameState), session.session_id]);
+    await pool.query(`NOTIFY game_completed, '${JSON.stringify({ session_id: session.session_id })}'`);
+}
+
+// --- ORIGINAL PVB GAME LOGIC (PRESERVED) ---
 
 async function runOriginalPinpointBowling(session) {
     const messageTextHTML = `🎳 <b>Pinpoint Bowling Challenge!</b> 🎳\n\n` +
-        `<b>Predict the exact outcome of the roll!</b>\n\n` +
-        `Choose your target pin below. You have ${PLAYER_CHOICE_TIMEOUT / 1000} seconds.`;
+        `<b>Predict the exact outcome of the roll!</b> Choose your target below. You have ${PLAYER_CHOICE_TIMEOUT / 1000} seconds.`;
 
     const keyboard = {
         inline_keyboard: [
@@ -138,113 +271,6 @@ async function runDartsFortune(session) {
 async function runThreePointShootout(session) {
     await processThreePointShot(session.session_id);
 }
-
-
-// --- NEW DUEL GAME LOGIC (PvB & PvP) ---
-
-async function runBowlingDuel(session) {
-    const logPrefix = `[Helper_BowlingDuel_PvB SID:${session.session_id}]`;
-    const tempMsg = await queuedSendMessage(session.chat_id, `🎳 **Your Turn:** Rolling 3 frames...`);
-    
-    let playerRolls = [];
-    for (let i = 0; i < BOWLING_FRAMES; i++) {
-        const diceMsg = await bot.sendDice(session.chat_id, { emoji: '🎳' });
-        await sleep(2200);
-        playerRolls.push(diceMsg.dice.value);
-        await bot.deleteMessage(session.chat_id, diceMsg.message_id).catch(()=>{});
-    }
-    const playerScore = playerRolls.reduce((a, b) => a + b, 0);
-    const playerResultMsg = await queuedSendMessage(session.chat_id, `Your final score: <b>${playerScore}</b> (${playerRolls.join(' + ')})`);
-    await bot.deleteMessage(session.chat_id, tempMsg.message_id).catch(()=>{});
-    
-    await sleep(1500);
-    const tempMsgBot = await queuedSendMessage(session.chat_id, `🤖 **Bot's Turn:** Rolling 3 frames...`);
-
-    let botRolls = [];
-    for (let i = 0; i < BOWLING_FRAMES; i++) {
-        const diceMsg = await bot.sendDice(session.chat_id, { emoji: '🎳' });
-        await sleep(2200);
-        botRolls.push(diceMsg.dice.value);
-        await bot.deleteMessage(session.chat_id, diceMsg.message_id).catch(()=>{});
-    }
-    const botScore = botRolls.reduce((a, b) => a + b, 0);
-    const botResultMsg = await queuedSendMessage(session.chat_id, `Bot's final score: <b>${botScore}</b> (${botRolls.join(' + ')})`);
-
-    await bot.deleteMessage(session.chat_id, tempMsgBot.message_id).catch(()=>{});
-    await sleep(4000);
-    await bot.deleteMessage(session.chat_id, playerResultMsg.message_id).catch(()=>{});
-    await bot.deleteMessage(session.chat_id, botResultMsg.message_id).catch(()=>{});
-
-    let finalStatus = (playerScore > botScore) ? 'completed_win' : (botScore > playerScore) ? 'completed_loss' : 'completed_push';
-    let finalPayout = 0n;
-
-    if (finalStatus === 'completed_win') {
-        finalPayout = BigInt(session.bet_amount_lamports) * 2n;
-    } else if (finalStatus === 'completed_push') {
-        finalPayout = BigInt(session.bet_amount_lamports);
-    }
-    
-    const finalGameState = { ...session.game_state_json, playerScore, botScore };
-    await pool.query("UPDATE interactive_game_sessions SET status = $1, final_payout_lamports = $2, game_state_json = $3 WHERE session_id = $4", [finalStatus, finalPayout.toString(), JSON.stringify(finalGameState), session.session_id]);
-    await pool.query(`NOTIFY game_completed, '${JSON.stringify({ session_id: session.session_id })}'`);
-}
-
-async function runInteractivePvP(session) {
-    const logPrefix = `[Helper_PvP SID:${session.session_id} Type:${session.game_type}]`;
-    const gameState = session.game_state_json || {};
-    const p1Name = gameState.initiatorName || "Player 1";
-    const p2Name = gameState.opponentName || "Player 2";
-    
-    let shots = 1, emoji = '🎲', gameName = "Duel";
-    switch(session.game_type) {
-        case 'bowling_duel_pvp': shots = BOWLING_FRAMES; emoji = '🎳'; gameName = "Bowling Duel"; break;
-        case 'darts_duel_pvp': shots = 1; emoji = '🎯'; gameName = "Darts Showdown"; break;
-        case 'basketball_clash_pvp': shots = BASKETBALL_SHOTS; emoji = '🏀'; gameName = "3-Point Clash"; break;
-    }
-    
-    const tempDuelMsg = await queuedSendMessage(session.chat_id, `⚔️ <b>${gameName}</b>: ${p1Name} vs. ${p2Name} ⚔️\nRolling for both players...`, { parse_mode: 'HTML' });
-
-    let p1Rolls = [], p2Rolls = [];
-    
-    const tempP1Msg = await queuedSendMessage(session.chat_id, `Rolling for <b>${p1Name}</b>...`, { parse_mode: 'HTML' });
-    for (let i = 0; i < shots; i++) {
-        const diceMsg = await bot.sendDice(session.chat_id, { emoji });
-        await sleep(2200);
-        p1Rolls.push(diceMsg.dice.value);
-        await bot.deleteMessage(session.chat_id, diceMsg.message_id).catch(()=>{});
-    }
-    const p1Score = (gameName === "3-Point Clash") ? p1Rolls.filter(r => r >= 4).length : p1Rolls.reduce((a, b) => a + b, 0);
-    const p1ResultMsg = await queuedSendMessage(session.chat_id, `<b>${p1Name}'s</b> final score: <b>${p1Score}</b>`);
-    await bot.deleteMessage(session.chat_id, tempP1Msg.message_id).catch(()=>{});
-
-    await sleep(1500);
-
-    const tempP2Msg = await queuedSendMessage(session.chat_id, `Rolling for <b>${p2Name}</b>...`, { parse_mode: 'HTML' });
-    for (let i = 0; i < shots; i++) {
-        const diceMsg = await bot.sendDice(session.chat_id, { emoji });
-        await sleep(2200);
-        p2Rolls.push(diceMsg.dice.value);
-        await bot.deleteMessage(session.chat_id, diceMsg.message_id).catch(()=>{});
-    }
-    const p2Score = (gameName === "3-Point Clash") ? p2Rolls.filter(r => r >= 4).length : p2Rolls.reduce((a, b) => a + b, 0);
-    const p2ResultMsg = await queuedSendMessage(session.chat_id, `<b>${p2Name}'s</b> final score: <b>${p2Score}</b>`);
-    await bot.deleteMessage(session.chat_id, tempP2Msg.message_id).catch(()=>{});
-
-    await bot.deleteMessage(session.chat_id, tempDuelMsg.message_id).catch(()=>{});
-    await sleep(4000);
-    await bot.deleteMessage(session.chat_id, p1ResultMsg.message_id).catch(()=>{});
-    await bot.deleteMessage(session.chat_id, p2ResultMsg.message_id).catch(()=>{});
-    
-    let finalStatus = (p1Score > p2Score) ? 'completed_p1_win' : (p2Score > p1Score) ? 'completed_p2_win' : 'completed_push';
-    const finalGameState = { ...gameState, p1Score, p2Score, p1Rolls, p2Rolls };
-    
-    // Payout is handled by main bot, helper just determines winner
-    await pool.query("UPDATE interactive_game_sessions SET status = $1, game_state_json = $2 WHERE session_id = $3", [finalStatus, JSON.stringify(finalGameState), session.session_id]);
-    await pool.query(`NOTIFY game_completed, '${JSON.stringify({ session_id: session.session_id })}'`);
-}
-
-
-// --- INTERACTIVE PvB LOGIC (BASKETBALL - this is unchanged) ---
 
 async function processThreePointShot(sessionId) {
     const logPrefix = `[Helper_3PT GID:${sessionId}]`;
@@ -302,7 +328,7 @@ async function processThreePointShot(sessionId) {
 }
 
 
-// --- MAIN CALLBACK ROUTER (UNCHANGED) ---
+// --- LISTENERS (Callbacks & Database Notifications) ---
 
 bot.on('callback_query', async (callbackQuery) => {
     await bot.answerCallbackQuery(callbackQuery.id).catch(()=>{});
@@ -371,6 +397,96 @@ bot.on('callback_query', async (callbackQuery) => {
     }
 });
 
+async function setupNotificationListeners() {
+    console.log("⚙️ [Helper] Setting up notification listeners...");
+    const listeningClient = await pool.connect();
+    
+    listeningClient.on('error', (err) => {
+        console.error('[Helper] Listener client error:', err);
+        setTimeout(setupNotificationListeners, 5000);
+    });
+
+    listeningClient.on('notification', (msg) => {
+        try {
+            const payload = JSON.parse(msg.payload);
+            const session = payload.session || payload;
+            if (!session || !session.session_id) return;
+
+            if (msg.channel === 'game_session_pickup') {
+                console.log(`[Helper] ⚡ Received pickup notification for session ${session.session_id}`);
+                handleGameStart(session);
+            } else if (msg.channel === 'interactive_roll_submitted') {
+                console.log(`[Helper] ⚡ Received roll notification for session ${session.session_id}`);
+                handleRollSubmitted(session);
+            }
+        } catch (e) {
+            console.error('[Helper] Error processing notification payload:', e);
+        }
+    });
+
+    await listeningClient.query('LISTEN game_session_pickup');
+    await listeningClient.query('LISTEN interactive_roll_submitted');
+    console.log("✅ [Helper] Now listening for 'game_session_pickup' and 'interactive_roll_submitted' notifications.");
+}
+
+// --- Utility Functions for Helper ---
+function getCleanGameNameHelper(gameType) {
+    if (!gameType) return "Game";
+    const lowerCaseId = String(gameType).toLowerCase();
+    if (lowerCaseId.includes('bowling_duel')) return "Bowling Duel";
+    if (lowerCaseId.includes('darts_duel')) return "Darts Showdown";
+    if (lowerCaseId.includes('basketball_clash')) return "3-Point Clash";
+    if (lowerCaseId === 'bowling') return "Pinpoint Bowling";
+    if (lowerCaseId === 'darts') return "Darts of Fortune";
+    if (lowerCaseId === 'basketball') return "3-Point Shootout";
+    return "Game";
+}
+
+function getGameEmoji(gameType) {
+    if (gameType.includes('bowling')) return '🎳';
+    if (gameType.includes('darts')) return '🎯';
+    if (gameType.includes('basketball')) return '🏀';
+    return '🎲';
+}
+
+function formatRollsHelper(rolls) {
+    if (!rolls || rolls.length === 0) return '...';
+    return rolls.map(r => `<b>${r}</b>`).join(' ');
+}
+
+
 // --- Main Execution ---
 console.log('🚀 Helper Bot starting...');
-setInterval(processInteractiveGames, GAME_LOOP_INTERVAL);
+setupNotificationListeners().catch(e => {
+    console.error("CRITICAL: Could not set up notification listeners.", e);
+    process.exit(1);
+});
+
+// Fallback poller for any missed notifications or old game types
+setInterval(() => {
+    const logPrefix = '[Helper] Fallback Poller';
+    if (processInteractiveGames.isRunning) return;
+    processInteractiveGames.isRunning = true;
+    
+    let client = null;
+    try {
+        client = pool.connect();
+        const pendingSessions = client.query("SELECT * FROM interactive_game_sessions WHERE status = 'pending_pickup' AND game_type IN ('bowling', 'darts', 'basketball') ORDER BY created_at ASC LIMIT 5 FOR UPDATE SKIP LOCKED");
+
+        for (const session of pendingSessions.rows) {
+            console.log(`${logPrefix} Picked up original game session ${session.session_id} (Type: ${session.game_type})`);
+            client.query("UPDATE interactive_game_sessions SET status = 'in_progress', helper_bot_id = $1 WHERE session_id = $2", [MY_BOT_ID, session.session_id]);
+            
+            switch (session.game_type) {
+                case 'bowling': runOriginalPinpointBowling(session); break;
+                case 'darts': runDartsFortune(session); break;
+                case 'basketball': runThreePointShootout(session); break;
+            }
+        }
+    } catch (e) {
+        console.error(`${logPrefix} Error in fallback processing loop: ${e.message}`);
+    } finally {
+        if (client) client.release();
+        processInteractiveGames.isRunning = false;
+    }
+}, GAME_LOOP_INTERVAL);
