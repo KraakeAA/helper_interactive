@@ -134,8 +134,10 @@ async function handleRollSubmitted(session) {
 /**
  * The core state machine. Determines game progression.
  */
+// --- Start of REPLACEMENT for advanceGameState in helper_bot.js ---
+
 async function advanceGameState(sessionId) {
-    const logPrefix = `[AdvanceState SID:${sessionId}]`;
+    const logPrefix = `[AdvanceState_V2 SID:${sessionId}]`;
     let client = null;
     try {
         client = await pool.connect();
@@ -150,24 +152,33 @@ async function advanceGameState(sessionId) {
         const shotsPerPlayer = getShotsPerPlayer(gameType);
         
         const p1_done = (gameState.p1Rolls || []).length >= shotsPerPlayer;
-        const p2_done = isPvP ? ((gameState.p2Rolls || []).length >= shotsPerPlayer) : true;
-        
+
+        // --- THIS IS THE CORRECTED LOGIC FLOW ---
+
+        // 1. Check if the game is PvB and the player just finished. If so, it's the bot's turn.
+        if (!isPvP && p1_done) {
+            await runBotTurn(session, gameState);
+            return; // The bot's turn will finalize the game.
+        }
+
+        // 2. Check if the game is PvP and it's time to switch to player 2.
+        const p2_done = isPvP ? ((gameState.p2Rolls || []).length >= shotsPerPlayer) : false;
+        if (isPvP && p1_done && !p2_done) {
+            gameState.currentPlayerTurn = String(gameState.opponentId);
+            gameState.currentTurnStartTime = Date.now();
+            await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), sessionId]);
+            await promptNextPlayer(session, gameState);
+            return;
+        }
+
+        // 3. Check if the game is completely over (i.e., PvP and both players are done).
         if (p1_done && p2_done) {
             await finalizeGameSession(session, gameState);
             return;
         }
 
-        if (!p1_done) {
-            gameState.currentPlayerTurn = String(gameState.initiatorId);
-        } else if (isPvP && !p2_done) {
-            gameState.currentPlayerTurn = String(gameState.opponentId);
-        } else if (!isPvP && p1_done) {
-            await runBotTurn(session, gameState);
-            return;
-        }
-        
-        gameState.currentTurnStartTime = Date.now();
-        await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), sessionId]);
+        // 4. If none of the above, it means the current player's turn is not over yet.
+        // The currentPlayerTurn is already set, so we just re-prompt them.
         await promptNextPlayer(session, gameState);
 
     } catch (e) {
@@ -176,6 +187,8 @@ async function advanceGameState(sessionId) {
         if (client) client.release();
     }
 }
+
+// --- End of REPLACEMENT for advanceGameState ---
 
 /**
  * Sends the message to the group prompting the correct player for their turn.
