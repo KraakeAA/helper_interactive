@@ -219,19 +219,49 @@ async function promptNextPlayer(session, gameState) {
 /**
  * Simulates the bot's turn for PvB interactive games.
  */
+// --- Start of REPLACEMENT for runBotTurn in helper_bot.js ---
+
 async function runBotTurn(session, gameState) {
+    const logPrefix = `[RunBotTurn_V2 SID:${session.session_id}]`;
     await queuedSendMessage(session.chat_id, `🤖 The Bot Dealer is now taking its turn...`, { parse_mode: 'HTML' });
-    await sleep(2000);
+    await sleep(1500);
 
     const shotsPerPlayer = getShotsPerPlayer(session.game_type);
     let botRolls = [];
+
     for (let i = 0; i < shotsPerPlayer; i++) {
-        botRolls.push(Math.floor(Math.random() * 6) + 1);
+        try {
+            // Send an animated dice roll to the chat for visual feedback
+            const diceMessage = await bot.sendDice(session.chat_id, { emoji: getGameEmoji(session.game_type) });
+            
+            if (!diceMessage || !diceMessage.dice) {
+                throw new Error("Failed to get dice value from Telegram API.");
+            }
+            
+            botRolls.push(diceMessage.dice.value);
+            // Wait for the animation to finish before proceeding. 4 seconds is a safe bet for the animation to complete.
+            await sleep(4000); 
+            
+        } catch (e) {
+            console.error(`${logPrefix} Failed to send animated dice for bot, using internal roll. Error: ${e.message}`);
+            // Fallback to a silent, internal roll if the API fails
+            const internalRoll = Math.floor(Math.random() * 6) + 1;
+            botRolls.push(internalRoll);
+            await queuedSendMessage(session.chat_id, `(Bot's internal roll ${i+1}: <b>${internalRoll}</b>)`);
+            await sleep(1000); // Shorter sleep for internal fallback
+        }
     }
-    gameState.p2Rolls = botRolls;
+
+    gameState.p2Rolls = botRolls; // In PvB, p2 is the bot
+    
+    // Save the bot's complete turn to the database
     await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
+    
+    // Now that the bot's turn is complete and visually represented, finalize the game.
     await finalizeGameSession(session, gameState);
 }
+
+// --- End of REPLACEMENT for runBotTurn ---
 
 /**
  * Calculates final scores and updates the database to signal completion.
