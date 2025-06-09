@@ -1,4 +1,4 @@
-// helper_bot.js - FINAL UNIFIED VERSION v9 - All Logic & Functions Included, No Omissions
+// helper_bot.js - FINAL UNIFIED VERSION v11 - All Logic & Functions Included, No Omissions
 
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
@@ -12,10 +12,11 @@ const HELPER_BOT_TOKEN = process.env.HELPER_BOT_TOKEN;
 const DATABASE_URL = process.env.DATABASE_URL;
 const MY_BOT_ID = process.env.HELPER_BOT_ID || 'HelperBot_1';
 const GAME_LOOP_INTERVAL = 3000;
-const PLAYER_ACTION_TIMEOUT = 90000;
+const PLAYER_ACTION_TIMEOUT = 120000;
 
 // --- Basic Utilities ---
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+const PQueue = cjsPQueue.default ?? cjsPQueue;
 
 // --- Price Fetching & Formatting Dependencies ---
 const SOL_DECIMALS = 9;
@@ -57,6 +58,10 @@ const DOWNTOWN_SHOOTOUT_EFFECTS = {
 const PVP_BOWLING_FRAMES = 3;
 const PVP_BASKETBALL_SHOTS = 5;
 const PVP_DARTS_THROWS = 3;
+const THREE_POINT_PAYOUTS = [1.5, 2.2, 3.5, 5.0, 10.0, 20.0, 50.0];
+const PINPOINT_BOWLING_PAYOUT_MULTIPLIER = 5.5;
+const DARTS_FORTUNE_PAYOUTS = { 6: 3.5, 5: 1.5, 4: 0.5, 3: 0.2, 2: 0.1, 1: 0.0 };
+
 
 // --- Database & Bot Setup ---
 if (!HELPER_BOT_TOKEN || !DATABASE_URL) {
@@ -64,18 +69,18 @@ if (!HELPER_BOT_TOKEN || !DATABASE_URL) {
     process.exit(1);
 }
 const pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
-const PQueue = cjsPQueue.default ?? cjsPQueue;
 const bot = new TelegramBot(HELPER_BOT_TOKEN, { polling: { params: { allowed_updates: ["message", "callback_query"] } } });
 bot.on('polling_error', (error) => console.error(`[Helper] Polling Error: ${error.code} - ${error.message}`));
 const telegramSendQueue = new PQueue({ concurrency: 1, interval: 1000 / 20, intervalCap: 1 });
 const queuedSendMessage = (...args) => telegramSendQueue.add(() => bot.sendMessage(...args));
+
 
 // ===================================================================
 // --- GAME ENGINE & STATE MACHINE ---
 // ===================================================================
 
 async function handleGameStart(session) {
-    const logPrefix = `[HandleStart_V7 SID:${session.session_id}]`;
+    const logPrefix = `[HandleStart_V8 SID:${session.session_id}]`;
     console.log(`${logPrefix} Initializing game: ${session.game_type}`);
     let client = null;
     try {
@@ -115,8 +120,13 @@ async function handleGameStart(session) {
         } else if (isNewPvPDuel) {
             await advancePvPGameState(liveSession.session_id);
         } else {
-            console.error(`${logPrefix} Unhandled game type for new engine: ${gameType}`);
-            await finalizeGame(liveSession, 'error');
+             console.warn(`${logPrefix} Unhandled game type for new engine: ${gameType}. Checking legacy games.`);
+             switch (gameType) {
+                case 'original_bowling': await runOriginalPinpointBowling(liveSession); break;
+                case 'original_darts': await runDartsFortune(liveSession); break;
+                case 'original_basketball': await runThreePointShootout(liveSession); break;
+                default: console.error(`${logPrefix} Unknown game type: ${gameType}`); await finalizeGame(liveSession, 'error');
+            }
         }
     } catch (e) {
         if (client) await client.query('ROLLBACK');
@@ -127,7 +137,7 @@ async function handleGameStart(session) {
 }
 
 async function updateKingpinChallengeState(sessionId) {
-    const logPrefix = `[UpdateKingpinState SID:${sessionId}]`;
+    const logPrefix = `[UpdateKingpinState_V2 SID:${sessionId}]`;
     let client = null;
     try {
         client = await pool.connect();
@@ -138,7 +148,8 @@ async function updateKingpinChallengeState(sessionId) {
         const gameState = session.game_state_json;
         const rolls = gameState.rolls || [];
         const numRolls = rolls.length;
-        const { maxTurns, emoji, effects } = getPressYourLuckConfig(session.game_type);
+        const gameType = session.game_type;
+        const { maxTurns, emoji, effects } = getPressYourLuckConfig(gameType);
 
         const lastRoll = rolls[numRolls - 1];
         if (lastRoll === 1) {
@@ -150,8 +161,13 @@ async function updateKingpinChallengeState(sessionId) {
             return;
         }
 
+        if (gameState.lastMessageId) {
+            await bot.deleteMessage(session.chat_id, gameState.lastMessageId).catch(() => {});
+        }
+
         const betDisplay = await formatBalanceForDisplay(session.bet_amount_lamports, 'USD');
-        let messageHTML = `<b>🎳 Kingpin's Challenge 🎳</b>\n\n` +
+        const gameName = getCleanGameNameHelper(gameType);
+        let messageHTML = `<b>${emoji} ${escape(gameName)} ${emoji}</b>\n\n` +
                           `Player: <b>${escape(gameState.p1Name)}</b> | Wager: <b>${escape(betDisplay)}</b>\n` +
                           `Multiplier: <b>x${gameState.currentMultiplier.toFixed(2)}</b>\n\n`;
 
@@ -182,13 +198,7 @@ async function updateKingpinChallengeState(sessionId) {
         messageHTML += `<i>${callToAction}</i>`;
         
         const messageOptions = { parse_mode: 'HTML', reply_markup: keyboard };
-        let sentMsg;
-        if (gameState.lastMessageId) {
-            sentMsg = await bot.editMessageText(messageHTML, { chat_id: session.chat_id, message_id: gameState.lastMessageId, ...messageOptions }).catch(() => null);
-            if (!sentMsg) sentMsg = await queuedSendMessage(session.chat_id, messageHTML, messageOptions);
-        } else {
-            sentMsg = await queuedSendMessage(session.chat_id, messageHTML, messageOptions);
-        }
+        const sentMsg = await queuedSendMessage(session.chat_id, messageHTML, messageOptions);
         
         if (sentMsg) {
             gameState.lastMessageId = sentMsg.message_id;
@@ -231,7 +241,6 @@ async function advancePvPGameState(sessionId) {
             gameState.currentPlayerTurn = String(gameState.opponentId);
         }
         
-        gameState.currentTurnStartTime = Date.now();
         await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), sessionId]);
         await promptPvPAction(session, gameState);
     } catch (e) {
@@ -259,8 +268,7 @@ async function promptPvPAction(session, gameState) {
     let scoreBoardHTML = `<b>${p1Name}:</b> ${formatRollsHelper(p1Rolls || [])} ➠ Score: <b>${p1Score}</b>\n` +
                          `<b>${p2Name}:</b> ${formatRollsHelper(p2Rolls || [])} ➠ Score: <b>${p2Score}</b>`;
 
-    let messageHTML = `⚔️ <b>${gameName}</b> ⚔️\n\n` +
-                      `${scoreBoardHTML}\n\n` +
+    let messageHTML = `⚔️ <b>${gameName}</b> ⚔️\n\n${scoreBoardHTML}\n\n` +
                       `It's your turn, <b>${nextPlayerName}</b>! Send a ${emoji} to roll (Roll ${nextPlayerRolls.length + 1} of ${shotsPerPlayer}).`;
                       
     await queuedSendMessage(chat_id, messageHTML, { parse_mode: 'HTML' });
@@ -296,6 +304,7 @@ async function handleRollSubmitted(session, lastRoll) {
             gameState.lastRollValue = rollValue;
             const effect = getPressYourLuckConfig(liveSession.game_type).effects[rollValue];
             gameState.currentMultiplier = (gameState.currentMultiplier || 1.0) * effect.multiplier_increase;
+            gameState.turn++;
             await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), liveSession.session_id]);
             await updateKingpinChallengeState(liveSession.session_id);
         }
@@ -361,6 +370,10 @@ async function finalizeGame(session, finalStatus) {
     }
 }
 
+// ===================================================================
+// --- EVENT HANDLERS & MAIN LOOP ---
+// ===================================================================
+
 bot.on('callback_query', async (callbackQuery) => {
     const data = callbackQuery.data;
     if (data && data.startsWith('interactive_cashout:')) {
@@ -372,7 +385,6 @@ bot.on('callback_query', async (callbackQuery) => {
             if(String(session.user_id) !== String(callbackQuery.from.id)) return;
             await finalizeGame(session, 'completed_cashout');
         }
-        return;
     }
 });
 
@@ -432,13 +444,12 @@ async function processPendingGames() {
 }
 processPendingGames.isRunning = false;
 
+
+// ===================================================================
 // --- UTILITY FUNCTIONS ---
+// ===================================================================
 
-function escape(text) {
-    if (text === null || typeof text === 'undefined') return '';
-    return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');
-}
-
+function escape(text) { if (text === null || typeof text === 'undefined') return ''; return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');}
 function stringifyWithBigInt(obj) { return JSON.stringify(obj, (key, value) => (typeof value === 'bigint' ? value.toString() + 'n' : value), 2); }
 async function fetchSolUsdPriceFromBinanceAPI() { try { const response = await axios.get('https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT', { timeout: 8000 }); if (response.data?.price) return parseFloat(response.data.price); throw new Error('Invalid price data from Binance API.'); } catch (error) { throw error; }}
 async function fetchSolUsdPriceFromCoinGeckoAPI() { try { const response = await axios.get('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd', { timeout: 8000 }); if (response.data?.solana?.usd) return parseFloat(response.data.solana.usd); throw new Error('Invalid price data from CoinGecko API.'); } catch (error) { throw error; }}
