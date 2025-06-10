@@ -181,12 +181,13 @@ async function runPvBGame(session) {
 }
 
 async function promptPvBAction(session) {
-    const gameState = session.game_state_json;
-    const totalTurns = getPvBTotalTurns(session.game_type);
-    const emoji = getGameEmoji(session.game_type);
+    const gameState = session.game_state_json;
+    const totalTurns = getPvBTotalTurns(session.game_type);
+    const emoji = getGameEmoji(session.game_type);
 
-    const prompt = `--- <b>Turn ${gameState.currentTurn} of ${totalTurns}</b> ---\nIt's your turn, <b>${escape(gameState.p1Name)}</b>! Send a ${emoji} to play.`;
-    await queuedSendMessage(session.chat_id, prompt, { parse_mode: 'HTML' });
+    // CORRECTED: Added "in this chat" to the prompt for clarity.
+    const prompt = `--- <b>Turn ${gameState.currentTurn} of ${totalTurns}</b> ---\nIt's your turn, <b>${escape(gameState.p1Name)}</b>! Send a ${emoji} **in this chat** to play.`;
+    await queuedSendMessage(session.chat_id, prompt, { parse_mode: 'HTML' });
 }
 
 async function handlePvBRoll(session, playerRollValue) {
@@ -301,18 +302,20 @@ async function advancePvPGameState(sessionId) {
     await promptPvPAction(session, gameState);
 }
 async function promptPvPAction(session, gameState) {
-    const { chat_id, game_type } = session;
-    const { p1Name, p2Name, p1Rolls, p2Rolls, currentPlayerTurn, initiatorId } = gameState;
-    const gameName = getCleanGameNameHelper(game_type);
-    const emoji = getGameEmoji(game_type);
-    const shotsPerPlayer = getShotsPerPlayer(game_type);
-    const p1Score = calculateFinalScore(game_type, p1Rolls);
-    const p2Score = calculateFinalScore(game_type, p2Rolls);
-    const nextPlayerName = (String(currentPlayerTurn) === String(initiatorId)) ? p1Name : p2Name;
-    const nextPlayerRolls = (String(currentPlayerTurn) === String(initiatorId)) ? (p1Rolls || []) : (p2Rolls || []);
-    let scoreBoardHTML = `<b>${p1Name}:</b> ${formatRollsHelper(p1Rolls || [])} ➠ Score: <b>${p1Score}</b>\n` + `<b>${p2Name}:</b> ${formatRollsHelper(p2Rolls || [])} ➠ Score: <b>${p2Score}</b>`;
-    let messageHTML = `⚔️ <b>${gameName}</b> ⚔️\n\n${scoreBoardHTML}\n\n` + `It's your turn, <b>${nextPlayerName}</b>! Send a ${emoji} to roll (Roll ${nextPlayerRolls.length + 1} of ${shotsPerPlayer}).`;
-    await queuedSendMessage(chat_id, messageHTML, { parse_mode: 'HTML' });
+    const { chat_id, game_type } = session;
+    const { p1Name, p2Name, p1Rolls, p2Rolls, currentPlayerTurn, initiatorId } = gameState;
+    const gameName = getCleanGameNameHelper(game_type);
+    const emoji = getGameEmoji(game_type);
+    const shotsPerPlayer = getShotsPerPlayer(game_type);
+    const p1Score = calculateFinalScore(game_type, p1Rolls);
+    const p2Score = calculateFinalScore(game_type, p2Rolls);
+    const nextPlayerName = (String(currentPlayerTurn) === String(initiatorId)) ? p1Name : p2Name;
+    const nextPlayerRolls = (String(currentPlayerTurn) === String(initiatorId)) ? (p1Rolls || []) : (p2Rolls || []);
+    let scoreBoardHTML = `<b>${p1Name}:</b> ${formatRollsHelper(p1Rolls || [])} ➠ Score: <b>${p1Score}</b>\n` + `<b>${p2Name}:</b> ${formatRollsHelper(p2Rolls || [])} ➠ Score: <b>${p2Score}</b>`;
+    
+    // CORRECTED: Added "in this chat" to the prompt for clarity.
+    let messageHTML = `⚔️ <b>${gameName}</b> ⚔️\n\n${scoreBoardHTML}\n\n` + `It's your turn, <b>${nextPlayerName}</b>! Send a ${emoji} **in this chat** to roll (Roll ${nextPlayerRolls.length + 1} of ${shotsPerPlayer}).`;
+    await queuedSendMessage(chat_id, messageHTML, { parse_mode: 'HTML' });
 }
 async function handleRollSubmitted(session, lastRoll) {
     if (session.status !== 'in_progress') return;
