@@ -337,63 +337,71 @@ async function handleRollSubmitted(session, lastRoll) {
 }
 async function finalizeGame(session, finalStatus) {
     const sessionId = session.session_id;
-    if (activeTurnTimeouts.has(sessionId)) { clearTimeout(activeTurnTimeouts.get(sessionId)); activeTurnTimeouts.delete(sessionId); }
+    const logPrefix = `[FinalizeGame_V2 SID:${sessionId}]`;
+
+    if (activeTurnTimeouts.has(sessionId)) { 
+        clearTimeout(activeTurnTimeouts.get(sessionId));
+        activeTurnTimeouts.delete(sessionId); 
+    }
+    
     let client = null;
     try {
         client = await pool.connect();
         await client.query('BEGIN');
+
         const liveSessionRes = await client.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1 FOR UPDATE", [sessionId]);
-        if(liveSessionRes.rowCount === 0 || liveSessionRes.rows[0].status !== 'in_progress') { await client.query('ROLLBACK'); return; }
+        if(liveSessionRes.rowCount === 0 || liveSessionRes.rows[0].status !== 'in_progress') {
+            console.log(`${logPrefix} Game already finalized or not in progress. Aborting.`);
+            await client.query('ROLLBACK'); 
+            return; 
+        }
+        
         const liveSession = liveSessionRes.rows[0];
         const gameState = liveSession.game_state_json;
         let dbStatus = finalStatus;
-        let finalPayout = 0n;
 
-        if (finalStatus === 'completed_cashout') { // For Darts 501
-            dbStatus = 'completed_cashout';
-            const multiplier = gameState.currentMultiplier || 0;
-            finalPayout = (BigInt(liveSession.bet_amount_lamports) * BigInt(Math.floor(multiplier * 100))) / 100n;
-        } else if (['completed_loss', 'completed_timeout', 'error'].includes(finalStatus)) {
-            dbStatus = finalStatus === 'completed_timeout' ? 'completed_timeout' : 'completed_loss';
-            finalPayout = 0n;
-        } else if (finalStatus === 'pvb_resolve') {
-            const { p1Name, playerScore, botScore } = gameState;
-            let resultText = '';
-            if ((liveSession.game_type === 'bowling' || liveSession.game_type === 'darts') && playerScore === botScore) {
-                dbStatus = 'completed_loss'; // Bot wins ties - HOUSE EDGE
-                resultText = `It's a draw, so the House wins. Better luck next time!`;
-            } else if (liveSession.game_type === 'basketball' && playerScore === botScore) {
+        // Determine final status based on game logic, but DO NOT calculate lamports here.
+        if (finalStatus === 'pvb_resolve') {
+            if ((liveSession.game_type === 'bowling' || liveSession.game_type === 'darts') && gameState.playerScore === gameState.botScore) {
+                dbStatus = 'completed_loss'; // Bot wins ties
+            } else if (liveSession.game_type === 'basketball' && gameState.playerScore === gameState.botScore) {
                 dbStatus = 'completed_push'; // Push on tie
-                resultText = `It's a draw! Your wager has been returned.`;
-            } else if (playerScore > botScore) {
+            } else if (gameState.playerScore > gameState.botScore) {
                 dbStatus = 'completed_win';
-                resultText = `Congratulations, <b>${escape(p1Name)}</b>, you win!`;
             } else {
                 dbStatus = 'completed_loss';
-                resultText = `The Bot wins the duel.`;
             }
-             let finalMsg = `--- 🏁 <b>Game Over</b> 🏁 ---\n\n`;
-             finalMsg += `<b>Final Score:</b> ${escape(p1Name)} <b>${playerScore}</b> - <b>${botScore}</b> Bot\n\n`;
-             finalMsg += `${resultText}`;
-             await queuedSendMessage(liveSession.chat_id, finalMsg, {parse_mode: 'HTML'});
-
         } else if (finalStatus === 'pvp_resolve') {
             const p1Score = calculateFinalScore(liveSession.game_type, gameState.p1Rolls);
             const p2Score = calculateFinalScore(liveSession.game_type, gameState.p2Rolls);
-            gameState.p1Score = p1Score; gameState.p2Score = p2Score;
+            gameState.p1Score = p1Score; 
+            gameState.p2Score = p2Score;
             if (p1Score > p2Score) dbStatus = 'completed_p1_win';
             else if (p2Score > p1Score) dbStatus = 'completed_p2_win';
             else dbStatus = 'completed_push';
+        } else if (['completed_loss', 'completed_timeout', 'error'].includes(finalStatus)) {
+            dbStatus = finalStatus === 'completed_timeout' ? 'completed_timeout' : 'completed_loss';
         }
 
         gameState.finalStatus = dbStatus;
-        await client.query("UPDATE interactive_game_sessions SET status = $1, final_payout_lamports = $2, game_state_json = $3 WHERE session_id = $4", [dbStatus, finalPayout.toString(), JSON.stringify(gameState), sessionId]);
+        
+        // The helper now only updates the status and game state. 
+        // `final_payout_lamports` is no longer set here. The main bot will calculate it.
+        await client.query("UPDATE interactive_game_sessions SET status = $1, game_state_json = $2 WHERE session_id = $3", [dbStatus, JSON.stringify(gameState), sessionId]);
+        
+        // Notify the main bot that the game is complete.
         await client.query(`NOTIFY game_completed, '${JSON.stringify({ session_id: sessionId })}'`);
         await client.query('COMMIT');
+        
         if(gameState.lastMessageId) { // For Darts 501
-            await bot.deleteMessage(liveSession.chat_id, gameState.lastMessageId).catch(()=>{});
+             await bot.deleteMessage(liveSession.chat_id, gameState.lastMessageId).catch(()=>{});
         }
-    } catch (e) { if(client) await client.query('ROLLBACK'); console.error(`[FinalizeGame SID:${sessionId}] Error: ${e.message}`); } finally { if(client) client.release(); }
+    } catch (e) { 
+        if(client) await client.query('ROLLBACK'); 
+        console.error(`${logPrefix} Error: ${e.message}`); 
+    } finally { 
+        if(client) client.release(); 
+    }
 }
 
 // --- EVENT HANDLERS & MAIN LOOP ---
