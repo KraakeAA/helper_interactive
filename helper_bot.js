@@ -1,4 +1,4 @@
-// helper_bot.js - FINAL UNIFIED VERSION v25 - Dual Darts Games & Auto-Roll Implemented
+// helper_bot.js - FINAL UNIFIED VERSION v26 - Visual Auto-Roll Implemented
 
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
@@ -13,6 +13,7 @@ const DATABASE_URL = process.env.DATABASE_URL;
 const MY_BOT_ID = process.env.HELPER_BOT_ID || 'HelperBot_1';
 const GAME_LOOP_INTERVAL = 3000;
 const PLAYER_ACTION_TIMEOUT = 45000; // 45-second timeout for a player's turn
+const VISUAL_ROLL_DELAY = 2000; // 2-second delay for the "play out" animation
 
 // --- Basic Utilities ---
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -38,8 +39,8 @@ const NEW_BOWLING_MULTIPLIERS = { STRIKE: 1.75, SPARE: 1.40, OPEN: 0.85 };
 const BLITZ_DARTS_ROUNDS = 3;
 const BLITZ_DARTS_THROWS_PER_ROUND = 2;
 const BLITZ_DARTS_POINTS_PER_ROLL = { 6: 60, 5: 50, 4: 40, 3: 20, 2: 7, 1: 1 };
-const BLITZ_DARTS_MULTIPLIERS = [1.5, 3.0, 5.0]; // Multiplier for completing rounds 1, 2, 3
-const BLITZ_DARTS_BUST_ROLL_MAX = 2; // If both rolls in a round are this or lower, it's a bust
+const BLITZ_DARTS_MULTIPLIERS = [1.5, 3.0, 5.0];
+const BLITZ_DARTS_BUST_ROLL_MAX = 2;
 
 // Performance-Based Darts 501 Challenge (PvB) Constants
 const DARTS_501_START_SCORE = 501;
@@ -83,7 +84,7 @@ async function runRoundBasedHoops(session) {
     gameState.currentMultiplier = 1.0;
     gameState.status = 'awaiting_decision';
     await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
-    await updateRoundBasedHoopsMessage(session.session_id);
+    await updateRoundBasedHoopsMessage(session);
 }
 async function updateRoundBasedHoopsMessage(session, lastRoundRolls = null) {
     const res = await pool.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [session.session_id]);
@@ -98,7 +99,7 @@ async function updateRoundBasedHoopsMessage(session, lastRoundRolls = null) {
     
     let titleHTML = `🏀 <b>Round-Based Hoops</b> | ${escape(gameState.p1Name)}\n`;
     let bodyHTML = `Wager: <b>${escape(betDisplayUSD)}</b>\n\n`;
-    if (lastRoundRolls) { bodyHTML += `<i>Last Round's Shots: ${lastRoundRolls.join(', ')}</i>\n`; }
+    if (lastRoundRolls) { bodyHTML += `<i>Last Round's Shots: ${rolls.join(', ')}</i>\n`; }
     bodyHTML += `<b>Round: ${gameState.currentRound}/${ROUND_BASED_HOOPS_ROUNDS}</b> | Multiplier: <b>x${gameState.currentMultiplier.toFixed(2)}</b>\n`;
     bodyHTML += `Current Payout: <b>${escape(currentPayoutDisplay)}</b>\n\n`;
     
@@ -118,7 +119,10 @@ async function updateRoundBasedHoopsMessage(session, lastRoundRolls = null) {
     }
 }
 async function handleRoundBasedHoopsContinue(session) {
-    const gameState = session.game_state_json;
+    const { chat_id, game_state_json: gameState } = session;
+    await queuedEditMessage("Taking the shots...\n`🏀... 🏀...`", { chat_id, message_id: gameState.lastMessageId, parse_mode: 'Markdown' });
+    await sleep(VISUAL_ROLL_DELAY);
+    
     const rolls = [rollDice(), rollDice()];
     let roundMultiplier = 1.0;
     for (const roll of rolls) {
@@ -175,7 +179,10 @@ async function updateKingpinsChallengeMessage(session, lastFrameResult = null) {
     }
 }
 async function handleKingpinsChallengeContinue(session) {
-    const gameState = session.game_state_json;
+    const { chat_id, game_state_json: gameState } = session;
+    await queuedEditMessage("Ball is rolling...\n`💨... 🎳...`", { chat_id, message_id: gameState.lastMessageId, parse_mode: 'Markdown' });
+    await sleep(VISUAL_ROLL_DELAY);
+
     let frameResult = {};
     const roll1 = rollDice();
     if (roll1 === 1) { await finalizeGame(session, 'completed_loss'); return; }
@@ -245,7 +252,10 @@ async function updateBullseyeBlitzMessage(session, lastRoundResult = null) {
     }
 }
 async function handleBullseyeBlitzContinue(session) {
-    const gameState = session.game_state_json;
+    const { chat_id, game_state_json: gameState } = session;
+    await queuedEditMessage("Throwing Darts...\n`🎯... 🎯...`", { chat_id, message_id: gameState.lastMessageId, parse_mode: 'Markdown' });
+    await sleep(VISUAL_ROLL_DELAY);
+    
     const rolls = [rollDice(), rollDice()];
     if (rolls.every(r => r <= BLITZ_DARTS_BUST_ROLL_MAX)) { await finalizeGame(session, 'completed_loss'); return; }
     
@@ -316,7 +326,10 @@ async function updateDarts501Message(session, lastVisitResult = null) {
     }
 }
 async function handleDarts501Continue(session) {
-    const gameState = session.game_state_json;
+    const { chat_id, game_state_json: gameState } = session;
+    await queuedEditMessage("Throwing Darts...\n`🎯... 🎯...`", { chat_id, message_id: gameState.lastMessageId, parse_mode: 'Markdown' });
+    await sleep(VISUAL_ROLL_DELAY);
+    
     const rolls = [rollDice(), rollDice()];
     const scoreThisVisit = rolls.reduce((sum, roll) => sum + (BLITZ_DARTS_POINTS_PER_ROLL[roll] || 0), 0);
     let lastVisitResult = { rolls, score: scoreThisVisit, isBust: false };
@@ -370,7 +383,6 @@ async function handleGameStart(session) {
         await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), liveSession.session_id]);
         await client.query('COMMIT');
 
-        // Route to the appropriate game loop
         if (gameType === 'basketball') { await runRoundBasedHoops(liveSession); } 
         else if (gameType === 'bowling') { await runKingpinsChallenge(liveSession); }
         else if (gameType === 'darts') { await runBullseyeBlitz(liveSession); }
@@ -407,15 +419,13 @@ async function promptPvPAction(session, gameState) {
     await queuedSendMessage(chat_id, messageHTML, { parse_mode: 'HTML' });
 }
 async function handleRollSubmitted(session, lastRoll) {
-    if (session.status !== 'in_progress') return;
-    if (session.game_type.includes('_pvp')) {
-        const gameState = session.game_state_json || {};
-        const playerKey = (String(gameState.initiatorId) === gameState.currentPlayerTurn) ? 'p1' : 'p2';
-        if (!gameState[`${playerKey}Rolls`]) gameState[`${playerKey}Rolls`] = [];
-        gameState[`${playerKey}Rolls`].push(lastRoll);
-        await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
-        await advancePvPGameState(session.session_id);
-    }
+    if (session.status !== 'in_progress' || !session.game_type.includes('_pvp')) return;
+    const gameState = session.game_state_json || {};
+    const playerKey = (String(gameState.initiatorId) === gameState.currentPlayerTurn) ? 'p1' : 'p2';
+    if (!gameState[`${playerKey}Rolls`]) gameState[`${playerKey}Rolls`] = [];
+    gameState[`${playerKey}Rolls`].push(lastRoll);
+    await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
+    await advancePvPGameState(session.session_id);
 }
 async function finalizeGame(session, finalStatus) {
     const sessionId = session.session_id;
@@ -526,7 +536,7 @@ processPendingGames.isRunning = false;
 
 // --- UTILITY FUNCTIONS ---
 function escape(text) { if (text === null || typeof text === 'undefined') return ''; return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');}
-async function getSolUsdPrice() { const cached = solPriceCache.get(SOL_PRICE_CACHE_KEY); if (cached && (Date.now() - cached.timestamp < SOL_USD_PRICE_CACHE_TTL_MS)) return cached.price; try { const price = parseFloat((await axios.get('https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT', { timeout: 8000 })).data?.price); solPriceCache.set(SOL_PRICE_CACHE_KEY, { price, timestamp: Date.now() }); return price; } catch (e) { try { const price = parseFloat((await axios.get('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd', { timeout: 8000 })).data?.solana?.usd); solPriceCache.set(SOL_PRICE_CACHE_KEY, { price, timestamp: Date.now() }); return price; } catch (e2) { if (cached) return cached.price; throw new Error("Could not retrieve SOL/USD price."); } }}
+async function getSolUsdPrice() { const cached = solPriceCache.get(SOL_PRICE_CACHE_KEY); if (cached && (Date.now() - cached.timestamp < SOL_USD_PRICE_CACHE_TTL_MS)) return cached.price; try { const price = parseFloat((await axios.get('https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT', { timeout: 8000 })).data?.price); solPriceCache.set(SOL_PRICE_CACHE_KEY, { price, timestamp: Date.now() }); return price; } catch (e) { try { const price = parseFloat((await axios.get('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd', { timeout: 8000 })).data?.solana?.usd); solPriceCache.set(SOL_PRICE_CACHE_KEY, { price, timestamp: Date.now() }); return parseFloat(price); } catch (e2) { if (cached) return cached.price; throw new Error("Could not retrieve SOL/USD price."); } }}
 function convertLamportsToUSDString(lamports, solUsdPrice, d = 2) { if (typeof solUsdPrice !== 'number' || solUsdPrice <= 0) return 'N/A'; const sol = Number(BigInt(lamports)) / Number(LAMPORTS_PER_SOL); return `$${(sol * solUsdPrice).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d })}`;}
 async function formatBalanceForDisplay(lamports, currency = 'USD') { if (currency === 'USD') { try { const price = await getSolUsdPrice(); return convertLamportsToUSDString(lamports, price); } catch (e) { return 'N/A'; } } return `${(Number(BigInt(lamports)) / Number(LAMPORTS_PER_SOL)).toFixed(SOL_DECIMALS)} SOL`;}
 function getShotsPerPlayer(gameType) { const lt = String(gameType).toLowerCase(); if (lt.includes('bowling_duel_pvp')) return PVP_BOWLING_FRAMES; if (lt.includes('basketball_clash_pvp')) return PVP_BASKETBALL_SHOTS; if (lt.includes('darts_duel_pvp')) return PVP_DARTS_THROWS; return 1; }
