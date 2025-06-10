@@ -1,4 +1,4 @@
-// helper_bot.js - FINAL UNIFIED VERSION v32 - Bugfix for Race Condition
+// helper_bot.js - FINAL UNIFIED VERSION v33 - Turn-Based PvB Overhaul
 
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
@@ -12,11 +12,10 @@ const HELPER_BOT_TOKEN = process.env.HELPER_BOT_TOKEN;
 const DATABASE_URL = process.env.DATABASE_URL;
 const MY_BOT_ID = process.env.HELPER_BOT_ID || 'HelperBot_1';
 const GAME_LOOP_INTERVAL = 3000;
-const PLAYER_ACTION_TIMEOUT = 45000;
+const PLAYER_ACTION_TIMEOUT = 45000; // Note: Timeout logic may need adjustment for turn-based games
 
 // --- Basic Utilities ---
 const PQueue = cjsPQueue.default ?? cjsPQueue;
-const rollDice = () => Math.floor(Math.random() * 6) + 1; // Kept as a fallback if needed
 
 // --- Price Fetching & Formatting Dependencies ---
 const SOL_DECIMALS = 9;
@@ -28,33 +27,26 @@ const SOL_USD_PRICE_CACHE_TTL_MS = 60 * 60 * 1000;
 const activeTurnTimeouts = new Map();
 
 // --- Game Constants ---
-// Kingpin's Challenge (PvB Bowling) Constants
-const NEW_BOWLING_FRAMES = 5;
-const NEW_BOWLING_PINS_PER_ROLL = { 5: 8, 4: 7, 3: 5, 2: 3 };
-const NEW_BOWLING_MULTIPLIERS = { STRIKE: 1.75, SPARE: 1.40, OPEN: 0.85 };
 
-// Bullseye Blitz (Fast PvB Darts) Constants
-const BLITZ_DARTS_ROUNDS = 3;
-const BLITZ_DARTS_THROWS_PER_ROUND = 2;
-const BLITZ_DARTS_POINTS_PER_ROLL = { 6: 60, 5: 50, 4: 40, 3: 20, 2: 7, 1: 1 };
-const BLITZ_DARTS_MULTIPLIERS = [1.5, 3.0, 5.0];
-const BLITZ_DARTS_BUST_ROLL_MAX = 2;
-
-// Performance-Based Darts 501 Challenge (PvB) Constants
+// Performance-Based Darts 501 Challenge (PvB - Solo) Constants
 const DARTS_501_START_SCORE = 501;
 const DARTS_501_VISIT_LIMIT = 8;
 const DARTS_501_THROWS_PER_VISIT = 2;
+const DARTS_501_POINTS_PER_ROLL = { 6: 60, 5: 50, 4: 40, 3: 20, 2: 7, 1: 1 };
 const DARTS_501_PAR_SCORE_PER_VISIT = 75;
 const DARTS_501_MULTIPLIER_GAIN = 0.15;
 const DARTS_501_MULTIPLIER_LOSS = 0.10;
 const DARTS_501_JACKPOT_MULTIPLIER = 10.00;
 
-// Round-Based Basketball (PvB) Game Constants
-const ROUND_BASED_HOOPS_ROUNDS = 5;
-const ROUND_BASED_HOOPS_SHOTS_PER_ROUND = 2;
-const ROUND_BASED_HOOPS_EFFECTS = { 6: { multiplier_effect: 1.8 }, 5: { multiplier_effect: 1.3 }, 4: { multiplier_effect: 1.1 }, 3: { multiplier_effect: 1.0 }, 2: { multiplier_effect: 0.9 }, 1: { multiplier_effect: 0.0 }};
+// --- NEW Turn-Based PvB Duel Game Constants ---
+const PVB_BOWLING_FRAMES = 3;
+const PVB_BASKETBALL_SHOTS = 5;
+const PVB_DARTS_THROWS = 3;
 
-// PvP Constants
+// Turn-Based Bowling Score Mapping
+const PVB_BOWLING_SCORES = { 6: 10, 5: 8, 4: 6, 3: 4, 2: 2, 1: 0 };
+
+// --- PvP Constants ---
 const PVP_BOWLING_FRAMES = 3;
 const PVP_BASKETBALL_SHOTS = 5;
 const PVP_DARTS_THROWS = 3;
@@ -71,232 +63,10 @@ bot.on('polling_error', (error) => console.error(`[Helper] Polling Error: ${erro
 // API Failsafe Queue: Process max 1 message every 3.5 seconds to stay under the 20 msg/min/group limit.
 const telegramSendQueue = new PQueue({ concurrency: 1, interval: 3500, intervalCap: 1 });
 const queuedSendMessage = (...args) => telegramSendQueue.add(() => bot.sendMessage(...args).catch(console.error));
-const queuedSendDice = (chat_id, emoji) => telegramSendQueue.add(() => bot.sendDice({ chat_id, emoji }).catch(console.error));
 
 
-// --- Round-Based Hoops (PvB Basketball) Game Logic ---
-async function runRoundBasedHoops(session) {
-    const gameState = session.game_state_json || {};
-    gameState.currentRound = 1;
-    gameState.currentMultiplier = 1.0;
-    await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
-    await updateRoundBasedHoopsMessage(session);
-}
-async function updateRoundBasedHoopsMessage(session, lastRoundInfo = null) {
-    const res = await pool.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [session.session_id]);
-    if (res.rowCount === 0) return;
-    const liveSession = res.rows[0];
-    const gameState = liveSession.game_state_json;
-    if (gameState.lastMessageId) { await bot.deleteMessage(liveSession.chat_id, gameState.lastMessageId).catch(() => {}); }
-    
-    const betDisplayUSD = await formatBalanceForDisplay(liveSession.bet_amount_lamports, 'USD');
-    const currentPayout = (BigInt(liveSession.bet_amount_lamports) * BigInt(Math.floor(gameState.currentMultiplier * 100))) / 100n;
-    const currentPayoutDisplay = await formatBalanceForDisplay(currentPayout, 'USD');
-    
-    let titleHTML = `🏀 <b>Round-Based Hoops</b> | ${escape(gameState.p1Name)}\n`;
-    let bodyHTML = `Wager: <b>${escape(betDisplayUSD)}</b>\n\n`;
-    if (lastRoundInfo) { bodyHTML += `<i>Last Round's Rolls: ${lastRoundInfo.rolls.join(', ')} (Multiplier x${lastRoundInfo.multiplier.toFixed(2)})</i>\n`; }
-    bodyHTML += `<b>Round: ${gameState.currentRound}/${ROUND_BASED_HOOPS_ROUNDS}</b> | Multiplier: <b>x${gameState.currentMultiplier.toFixed(2)}</b>\n`;
-    bodyHTML += `Current Payout: <b>${escape(currentPayoutDisplay)}</b>\n\n`;
-    
-    let promptHTML = `<i>Round ${gameState.currentRound}. Ready to shoot?</i>`;
-    const keyboardRows = [
-        [{ text: `💰 Cash Out (${currentPayoutDisplay})`, callback_data: `interactive_cashout:${liveSession.session_id}` }],
-        [{ text: `🏀 Shoot Hoops`, callback_data: `interactive_continue:${liveSession.session_id}` }]
-    ];
-
-    if (gameState.currentRound === 1 && !lastRoundInfo) {
-        promptHTML = `<i>Your first round. Let's play!</i>`;
-        keyboardRows.shift();
-    }
-
-    const fullMessage = `${titleHTML}${bodyHTML}${promptHTML}`;
-    const sentMsg = await queuedSendMessage(liveSession.chat_id, fullMessage, { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboardRows } });
-    if (sentMsg) {
-        gameState.lastMessageId = sentMsg.message_id;
-        await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), liveSession.session_id]);
-    }
-}
-async function handleRoundBasedHoopsContinue(session) {
-    await bot.deleteMessage(session.chat_id, session.game_state_json.lastMessageId).catch(() => {});
-    
-    const dicePromises = [];
-    for (let i = 0; i < ROUND_BASED_HOOPS_SHOTS_PER_ROUND; i++) {
-        dicePromises.push(queuedSendDice(session.chat_id, '🏀'));
-    }
-    const diceMessages = await Promise.all(dicePromises);
-
-    const rolls = diceMessages.map(msg => msg ? msg.dice.value : 1);
-    if (rolls.includes(undefined)) { await finalizeGame(session, 'error'); return; }
-
-    const gameState = session.game_state_json;
-    let roundMultiplier = 1.0;
-    for (const roll of rolls) {
-        const effect = ROUND_BASED_HOOPS_EFFECTS[roll];
-        if (effect.multiplier_effect === 0.0) { await finalizeGame(session, 'completed_loss'); return; }
-        roundMultiplier *= effect.multiplier_effect;
-    }
-
-    gameState.currentMultiplier *= roundMultiplier;
-    gameState.currentRound++;
-    if (gameState.currentRound > ROUND_BASED_HOOPS_ROUNDS) { await finalizeGame(session, 'completed_cashout'); }
-    else {
-        await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
-        await updateRoundBasedHoopsMessage(session, { rolls, multiplier: roundMultiplier });
-    }
-}
-
-// --- Kingpin's Challenge (PvB Bowling) Game Logic ---
-async function runKingpinsChallenge(session) {
-    const gameState = session.game_state_json || {};
-    gameState.currentFrame = 1;
-    gameState.currentMultiplier = 1.0;
-    await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
-    await updateKingpinsChallengeMessage(session);
-}
-async function updateKingpinsChallengeMessage(session, lastFrameResult = null) {
-    const res = await pool.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [session.session_id]);
-    if (res.rowCount === 0) return;
-    const liveSession = res.rows[0];
-    const gameState = liveSession.game_state_json;
-    if (gameState.lastMessageId) { await bot.deleteMessage(liveSession.chat_id, gameState.lastMessageId).catch(() => {}); }
-
-    const betDisplayUSD = await formatBalanceForDisplay(liveSession.bet_amount_lamports, 'USD');
-    const currentPayout = (BigInt(liveSession.bet_amount_lamports) * BigInt(Math.floor(gameState.currentMultiplier * 100))) / 100n;
-    const currentPayoutDisplay = await formatBalanceForDisplay(currentPayout, 'USD');
-    let titleHTML = `🎳 <b>Kingpin's Challenge</b> | ${escape(gameState.p1Name)}\n`;
-    let bodyHTML = `Wager: <b>${escape(betDisplayUSD)}</b>\n\n`;
-    if (lastFrameResult) { bodyHTML += `<i>Frame ${gameState.currentFrame - 1} Result: <b>${escape(lastFrameResult.result)}</b> (Rolls: ${lastFrameResult.rolls.join(', ')})</i>\n`; }
-    bodyHTML += `Total Multiplier: <b>x${gameState.currentMultiplier.toFixed(2)}</b> | Payout: <b>${escape(currentPayoutDisplay)}</b>\n\n`;
-    
-    let promptHTML = `<i>Frame ${gameState.currentFrame}/${NEW_BOWLING_FRAMES}. Ready to bowl?</i>`;
-    const keyboardRows = [
-        [{ text: `💰 Cash Out (${currentPayoutDisplay})`, callback_data: `interactive_cashout:${liveSession.session_id}` }],
-        [{ text: `🎳 Bowl Next Frame`, callback_data: `interactive_continue:${liveSession.session_id}` }]
-    ];
-    if (gameState.currentFrame === 1 && !lastFrameResult) {
-        promptHTML = `<i>Your first frame. Good luck!</i>`;
-        keyboardRows.shift();
-    }
-    
-    const fullMessage = `${titleHTML}${bodyHTML}${promptHTML}`;
-    const sentMsg = await queuedSendMessage(liveSession.chat_id, fullMessage, { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboardRows } });
-    if (sentMsg) {
-        gameState.lastMessageId = sentMsg.message_id;
-        await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), liveSession.session_id]);
-    }
-}
-async function handleKingpinsChallengeContinue(session) {
-    await bot.deleteMessage(session.chat_id, session.game_state_json.lastMessageId).catch(() => {});
-
-    let frameResult = {};
-    const diceMessage1 = await queuedSendDice(session.chat_id, '🎳');
-    if (!diceMessage1 || !diceMessage1.dice) { await finalizeGame(session, 'error'); return; }
-    const roll1 = diceMessage1.dice.value;
-
-    if (roll1 === 1) { await finalizeGame(session, 'completed_loss'); return; }
-    
-    if (roll1 === 6) {
-        session.game_state_json.currentMultiplier *= NEW_BOWLING_MULTIPLIERS.STRIKE;
-        frameResult = { result: 'Strike 💎', rolls: [6] };
-    } else {
-        const diceMessage2 = await queuedSendDice(session.chat_id, '🎳');
-        if (!diceMessage2 || !diceMessage2.dice) { await finalizeGame(session, 'error'); return; }
-        const roll2 = diceMessage2.dice.value;
-
-        if (roll2 === 1) { await finalizeGame(session, 'completed_loss'); return; }
-        
-        const pinsFromFirstShot = NEW_BOWLING_PINS_PER_ROLL[roll1] || 0;
-        const pinsFromSecondShot = NEW_BOWLING_PINS_PER_ROLL[roll2] || 0;
-        if ((pinsFromFirstShot + pinsFromSecondShot) >= 10) {
-            session.game_state_json.currentMultiplier *= NEW_BOWLING_MULTIPLIERS.SPARE;
-            frameResult = { result: 'Spare ⭐', rolls: [roll1, roll2] };
-        } else {
-            session.game_state_json.currentMultiplier *= NEW_BOWLING_MULTIPLIERS.OPEN;
-            frameResult = { result: 'Open Frame', rolls: [roll1, roll2] };
-        }
-    }
-    
-    session.game_state_json.currentFrame++;
-    if (session.game_state_json.currentFrame > NEW_BOWLING_FRAMES) { await finalizeGame(session, 'completed_cashout'); }
-    else {
-        await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(session.game_state_json), session.session_id]);
-        await updateKingpinsChallengeMessage(session, frameResult);
-    }
-}
-
-// --- Bullseye Blitz (Fast PvB Darts) Game Logic ---
-async function runBullseyeBlitz(session) {
-    const gameState = session.game_state_json || {};
-    gameState.currentRound = 1;
-    gameState.totalScore = 0;
-    gameState.currentMultiplier = 1.0;
-    await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
-    await updateBullseyeBlitzMessage(session);
-}
-async function updateBullseyeBlitzMessage(session, lastRoundResult = null) {
-    const res = await pool.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [session.session_id]);
-    if (res.rowCount === 0) return;
-    const liveSession = res.rows[0];
-    const gameState = liveSession.game_state_json;
-    if (gameState.lastMessageId) { await bot.deleteMessage(liveSession.chat_id, gameState.lastMessageId).catch(() => {}); }
-
-    const betDisplayUSD = await formatBalanceForDisplay(liveSession.bet_amount_lamports, 'USD');
-    const currentPayout = (BigInt(liveSession.bet_amount_lamports) * BigInt(Math.floor(gameState.currentMultiplier * 100))) / 100n;
-    const currentPayoutDisplay = await formatBalanceForDisplay(currentPayout, 'USD');
-    let titleHTML = `🎯 <b>Bullseye Blitz</b> | ${escape(gameState.p1Name)}\n`;
-    let bodyHTML = `Wager: <b>${escape(betDisplayUSD)}</b>\n\n`;
-    if (lastRoundResult) { bodyHTML += `<i>Last Round's Darts: [${lastRoundResult.rolls.join(', ')}] scored ${lastRoundResult.score} points!</i>\n`; }
-    bodyHTML += `Total Score: <b>${gameState.totalScore}</b> | Multiplier: <b>x${gameState.currentMultiplier.toFixed(2)}</b>\n`;
-    bodyHTML += `Current Payout: <b>${escape(currentPayoutDisplay)}</b>\n\n`;
-    
-    let promptHTML = `<i>Round ${gameState.currentRound}/${BLITZ_DARTS_ROUNDS}. Ready to throw?</i>`;
-    const keyboardRows = [
-        [{ text: `💰 Cash Out (${currentPayoutDisplay})`, callback_data: `interactive_cashout:${liveSession.session_id}` }],
-        [{ text: `🎯 Throw Darts`, callback_data: `interactive_continue:${liveSession.session_id}` }]
-    ];
-    if (gameState.currentRound === 1 && !lastRoundResult) {
-        promptHTML = `<i>Your first round. Go for the bullseye!</i>`;
-        keyboardRows.shift();
-    }
-    
-    const fullMessage = `${titleHTML}${bodyHTML}${promptHTML}`;
-    const sentMsg = await queuedSendMessage(liveSession.chat_id, fullMessage, { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboardRows } });
-    if (sentMsg) {
-        gameState.lastMessageId = sentMsg.message_id;
-        await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), liveSession.session_id]);
-    }
-}
-async function handleBullseyeBlitzContinue(session) {
-    await bot.deleteMessage(session.chat_id, session.game_state_json.lastMessageId).catch(() => {});
-
-    const dicePromises = [];
-    for(let i=0; i<BLITZ_DARTS_THROWS_PER_ROUND; i++) {
-        dicePromises.push(queuedSendDice(session.chat_id, '🎯'));
-    }
-    const diceMessages = await Promise.all(dicePromises);
-    
-    const rolls = diceMessages.map(msg => msg ? msg.dice.value : 1);
-    if (rolls.includes(undefined)) { await finalizeGame(session, 'error'); return; }
-
-    if (rolls.every(r => r <= BLITZ_DARTS_BUST_ROLL_MAX)) { await finalizeGame(session, 'completed_loss'); return; }
-    
-    const gameState = session.game_state_json;
-    const scoreThisRound = rolls.reduce((sum, roll) => sum + (BLITZ_DARTS_POINTS_PER_ROLL[roll] || 0), 0);
-    gameState.totalScore += scoreThisRound;
-    gameState.currentMultiplier = BLITZ_DARTS_MULTIPLIERS[gameState.currentRound - 1];
-    
-    const roundResult = { rolls, score: scoreThisRound };
-    gameState.currentRound++;
-
-    if (gameState.currentRound > BLITZ_DARTS_ROUNDS) { await finalizeGame(session, 'completed_cashout'); }
-    else {
-        await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
-        await updateBullseyeBlitzMessage(session, roundResult);
-    }
-}
-
-// --- Performance-Based Darts 501 Challenge (PvB) Game Logic ---
+// --- Performance-Based Darts 501 Challenge (Solo PvB) Game Logic ---
+// This game is unique and remains in its "press-your-luck" format for variety.
 async function runDarts501Challenge(session) {
     const gameState = session.game_state_json || {};
     gameState.remainingScore = DARTS_501_START_SCORE;
@@ -351,17 +121,15 @@ async function updateDarts501Message(session, lastVisitResult = null) {
 async function handleDarts501Continue(session) {
     await bot.deleteMessage(session.chat_id, session.game_state_json.lastMessageId).catch(() => {});
     
-    const dicePromises = [];
-    for(let i=0; i<DARTS_501_THROWS_PER_VISIT; i++) {
-        dicePromises.push(queuedSendDice(session.chat_id, '🎯'));
-    }
+    // For Darts 501, we still need sendDice as it's not triggered by user message
+    const dicePromises = Array.from({ length: DARTS_501_THROWS_PER_VISIT }, () => bot.sendDice(session.chat_id, { emoji: '🎯' }).catch(console.error));
     const diceMessages = await Promise.all(dicePromises);
 
     const rolls = diceMessages.map(msg => msg ? msg.dice.value : 1);
-    if (rolls.includes(undefined)) { await finalizeGame(session, 'error'); return; }
+    if (rolls.includes(undefined) || rolls.includes(null)) { await finalizeGame(session, 'error'); return; }
 
     const gameState = session.game_state_json;
-    const scoreThisVisit = rolls.reduce((sum, roll) => sum + (BLITZ_DARTS_POINTS_PER_ROLL[roll] || 0), 0);
+    const scoreThisVisit = rolls.reduce((sum, roll) => sum + (DARTS_501_POINTS_PER_ROLL[roll] || 0), 0);
     let lastVisitResult = { rolls, score: scoreThisVisit, isBust: false };
     const scoreAfterThrow = gameState.remainingScore - scoreThisVisit;
 
@@ -385,6 +153,125 @@ async function handleDarts501Continue(session) {
 }
 
 
+// --- NEW Turn-Based Player-vs-Bot (PvB) Game Engine ---
+
+function getPvBTotalTurns(gameType) {
+    if (gameType === 'bowling') return PVB_BOWLING_FRAMES;
+    if (gameType === 'basketball') return PVB_BASKETBALL_SHOTS;
+    if (gameType === 'darts') return PVB_DARTS_THROWS;
+    return 3;
+}
+
+function getBotRoll(gameType) {
+    let roll = Math.floor(Math.random() * 6) + 1;
+    // House Edge Logic
+    if (gameType === 'darts' && roll === 1) {
+        roll = Math.floor(Math.random() * 6) + 1; // Re-roll on a 1
+    }
+    if (gameType === 'basketball') {
+        // Bot makes shot on 3, 4, 5, 6 (66.7% chance)
+        return (roll >= 3) ? { value: roll, points: 1, text: 'Made' } : { value: roll, points: 0, text: 'Missed' };
+    }
+    return { value: roll }; // Default return
+}
+
+async function runPvBGame(session) {
+    const gameState = session.game_state_json;
+    gameState.playerRolls = [];
+    gameState.botRolls = [];
+    gameState.playerScore = 0;
+    gameState.botScore = 0;
+    gameState.currentTurn = 1;
+
+    const gameName = getCleanGameNameHelper(session.game_type);
+    const betDisplay = await formatBalanceForDisplay(session.bet_amount_lamports, 'USD');
+    const emoji = getGameEmoji(session.game_type);
+    
+    let startMessage = `🔥 <b>${escape(gameName)} Duel</b> 🔥\n\n`;
+    startMessage += `Player: <b>${escape(gameState.p1Name)}</b>\n`;
+    startMessage += `Wager: <b>${escape(betDisplay)}</b>\n\n`;
+    startMessage += `The duel begins! First to ${getPvBTotalTurns(session.game_type)} turns wins.`;
+
+    await queuedSendMessage(session.chat_id, startMessage, { parse_mode: 'HTML' });
+    await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
+    await promptPvBAction(session);
+}
+
+async function promptPvBAction(session) {
+    const gameState = session.game_state_json;
+    const totalTurns = getPvBTotalTurns(session.game_type);
+    const emoji = getGameEmoji(session.game_type);
+
+    const prompt = `Turn ${gameState.currentTurn} of ${totalTurns}. It's your turn, <b>${escape(gameState.p1Name)}</b>! Send a ${emoji} to play.`;
+    await queuedSendMessage(session.chat_id, prompt, { parse_mode: 'HTML' });
+}
+
+async function handlePvBRoll(session, playerRollValue) {
+    const { game_type, game_state_json: gameState } = session;
+
+    // 1. Get Player's result
+    let playerResult = { value: playerRollValue };
+    if (game_type === 'bowling') {
+        playerResult.points = PVB_BOWLING_SCORES[playerRollValue] || 0;
+    } else if (game_type === 'basketball') {
+        // Player makes shot on 4, 5, 6 (50% chance)
+        playerResult.points = (playerRollValue >= 4) ? 1 : 0;
+        playerResult.text = (playerResult.points === 1) ? 'Made' : 'Missed';
+    } else if (game_type === 'darts') {
+        playerResult.points = DARTS_501_POINTS_PER_ROLL[playerRollValue] || 0;
+    }
+
+    // 2. Get Bot's result
+    let botResult = getBotRoll(game_type);
+    if (game_type === 'bowling') {
+        botResult.points = PVB_BOWLING_SCORES[botResult.value] || 0;
+    } else if (game_type === 'darts') {
+        botResult.points = DARTS_501_POINTS_PER_ROLL[botResult.value] || 0;
+    }
+    
+    // 3. Update Game State
+    gameState.playerRolls.push(playerRollValue);
+    gameState.botRolls.push(botResult.value);
+    gameState.playerScore += playerResult.points;
+    gameState.botScore += botResult.points;
+
+    // 4. Send Round Summary
+    await sendPvBRoundSummary(session, playerResult, botResult);
+
+    // 5. Check Game End Condition
+    const totalTurns = getPvBTotalTurns(game_type);
+    if (gameState.currentTurn >= totalTurns) {
+        await finalizeGame(session, 'pvb_resolve');
+    } else {
+        gameState.currentTurn++;
+        await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
+        await promptPvBAction(session); // Prompt for the next turn
+    }
+}
+
+async function sendPvBRoundSummary(session, playerResult, botResult) {
+    const { game_type, game_state_json: gameState } = session;
+    const emoji = getGameEmoji(game_type);
+
+    let summary = `--- <b>Turn ${gameState.currentTurn} Results</b> ---\n`;
+    if (game_type === 'bowling') {
+        summary += `${escape(gameState.p1Name)} rolled a ${playerResult.value} ${emoji} scoring <b>${playerResult.points}</b> points.\n`;
+        summary += `The Bot rolled a ${botResult.value} ${emoji} scoring <b>${botResult.points}</b> points.\n\n`;
+    } else if (game_type === 'basketball') {
+        summary += `${escape(gameState.p1Name)} shoots... <b>${playerResult.text}!</b> (Rolled a ${playerResult.value} ${emoji})\n`;
+        summary += `The Bot shoots... <b>${botResult.text}!</b> (Rolled a ${botResult.value} ${emoji})\n\n`;
+    } else if (game_type === 'darts') {
+        summary += `${escape(gameState.p1Name)}'s dart scores <b>${playerResult.points}</b> points! (Rolled a ${playerResult.value} ${emoji})\n`;
+        summary += `The Bot's dart scores <b>${botResult.points}</b> points! (Rolled a ${botResult.value} ${emoji})\n\n`;
+    }
+    summary += `<b>Total Score:</b>\n`;
+    summary += `- ${escape(gameState.p1Name)}: <b>${gameState.playerScore}</b>\n`;
+    summary += `- Bot: <b>${gameState.botScore}</b>`;
+
+    await queuedSendMessage(session.chat_id, summary, { parse_mode: 'HTML' });
+}
+
+
 // --- GAME ENGINE & STATE MACHINE ---
 async function handleGameStart(session) {
     const logPrefix = `[HandleStart SID:${session.session_id}]`;
@@ -400,24 +287,28 @@ async function handleGameStart(session) {
         const gameState = liveSession.game_state_json || {};
         const gameType = liveSession.game_type;
         
+        gameState.p1Name = gameState.initiatorName || "Player 1";
+        gameState.currentPlayerTurn = String(gameState.initiatorId || liveSession.user_id);
         if (gameType.includes('_pvp')) {
+            gameState.p2Name = gameState.opponentName || "Player 2";
             gameState.p1Rolls = []; gameState.p1Score = 0;
             gameState.p2Rolls = []; gameState.p2Score = 0;
         }
         
-        gameState.p1Name = gameState.initiatorName || "Player 1";
-        gameState.currentPlayerTurn = String(gameState.initiatorId || liveSession.user_id);
-        if (gameType.includes('_pvp')) gameState.p2Name = gameState.opponentName || "Player 2";
-        
         await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), liveSession.session_id]);
         await client.query('COMMIT');
 
-        if (gameType === 'basketball') { await runRoundBasedHoops(liveSession); } 
-        else if (gameType === 'bowling') { await runKingpinsChallenge(liveSession); }
-        else if (gameType === 'darts') { await runBullseyeBlitz(liveSession); }
-        else if (gameType === 'darts_501') { await runDarts501Challenge(liveSession); }
-        else if (gameType.includes('_pvp')) { await advancePvPGameState(liveSession.session_id); }
-        else { console.error(`${logPrefix} Unknown game type to start: ${gameType}`); await finalizeGame(liveSession, 'error'); }
+        // --- Game Type Routing ---
+        if (gameType === 'darts_501') {
+            await runDarts501Challenge(liveSession);
+        } else if (['bowling', 'basketball', 'darts'].includes(gameType)) {
+            await runPvBGame(liveSession); // NEW: Route to turn-based PvB engine
+        } else if (gameType.includes('_pvp')) {
+            await advancePvPGameState(liveSession.session_id);
+        } else {
+            console.error(`${logPrefix} Unknown game type to start: ${gameType}`);
+            await finalizeGame(liveSession, 'error');
+        }
     } catch (e) { if (client) await client.query('ROLLBACK'); console.error(`${logPrefix} Error initializing game: ${e.message}`); } finally { if (client) client.release(); }
 }
 async function advancePvPGameState(sessionId) {
@@ -448,13 +339,18 @@ async function promptPvPAction(session, gameState) {
     await queuedSendMessage(chat_id, messageHTML, { parse_mode: 'HTML' });
 }
 async function handleRollSubmitted(session, lastRoll) {
-    if (session.status !== 'in_progress' || !session.game_type.includes('_pvp')) return;
     const gameState = session.game_state_json || {};
-    const playerKey = (String(gameState.initiatorId) === gameState.currentPlayerTurn) ? 'p1' : 'p2';
-    if (!gameState[`${playerKey}Rolls`]) gameState[`${playerKey}Rolls`] = [];
-    gameState[`${playerKey}Rolls`].push(lastRoll);
-    await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
-    await advancePvPGameState(session.session_id);
+    // Differentiate between PvP and the new PvB
+    if (session.game_type.includes('_pvp')) {
+        const playerKey = (String(gameState.initiatorId) === gameState.currentPlayerTurn) ? 'p1' : 'p2';
+        if (!gameState[`${playerKey}Rolls`]) gameState[`${playerKey}Rolls`] = [];
+        gameState[`${playerKey}Rolls`].push(lastRoll);
+        await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
+        await advancePvPGameState(session.session_id);
+    } else if (['bowling', 'basketball', 'darts'].includes(session.game_type)) {
+        // Route to the new PvB handler
+        await handlePvBRoll(session, lastRoll);
+    }
 }
 async function finalizeGame(session, finalStatus) {
     const sessionId = session.session_id;
@@ -469,15 +365,38 @@ async function finalizeGame(session, finalStatus) {
         const gameState = liveSession.game_state_json;
         let dbStatus = finalStatus;
         let finalPayout = 0n;
-        if (finalStatus === 'completed_cashout') {
+
+        if (finalStatus === 'completed_cashout') { // For Darts 501
             dbStatus = 'completed_cashout';
             const multiplier = gameState.currentMultiplier || 0;
             finalPayout = (BigInt(liveSession.bet_amount_lamports) * BigInt(Math.floor(multiplier * 100))) / 100n;
         } else if (['completed_loss', 'completed_timeout', 'error'].includes(finalStatus)) {
             dbStatus = finalStatus === 'completed_timeout' ? 'completed_timeout' : 'completed_loss';
             finalPayout = 0n;
-        }
-        if (finalStatus === 'pvp_resolve') {
+        } else if (finalStatus === 'pvb_resolve') {
+            const { p1Name, playerScore, botScore } = gameState;
+            let resultText = '';
+            if ((liveSession.game_type === 'bowling' || liveSession.game_type === 'darts') && playerScore === botScore) {
+                dbStatus = 'completed_loss'; // Bot wins ties
+                resultText = `It's a draw! The House wins on ties.`;
+            } else if (liveSession.game_type === 'basketball' && playerScore === botScore) {
+                dbStatus = 'completed_push'; // Push on tie
+                resultText = `It's a draw! Your wager has been returned.`;
+            } else if (playerScore > botScore) {
+                dbStatus = 'completed_win';
+                resultText = `Congratulations, <b>${escape(p1Name)}</b>, you win!`;
+            } else {
+                dbStatus = 'completed_loss';
+                resultText = `The Bot wins this time. Better luck next time!`;
+            }
+             let finalMsg = `--- 🏁 <b>Game Over</b> 🏁 ---\n\n`;
+             finalMsg += `<b>Final Score:</b>\n`;
+             finalMsg += `- ${escape(p1Name)}: <b>${playerScore}</b>\n`;
+             finalMsg += `- Bot: <b>${botScore}</b>\n\n`;
+             finalMsg += `${resultText}`;
+             await queuedSendMessage(liveSession.chat_id, finalMsg, {parse_mode: 'HTML'});
+
+        } else if (finalStatus === 'pvp_resolve') {
             const p1Score = calculateFinalScore(liveSession.game_type, gameState.p1Rolls);
             const p2Score = calculateFinalScore(liveSession.game_type, gameState.p2Rolls);
             gameState.p1Score = p1Score; gameState.p2Score = p2Score;
@@ -485,11 +404,14 @@ async function finalizeGame(session, finalStatus) {
             else if (p2Score > p1Score) dbStatus = 'completed_p2_win';
             else dbStatus = 'completed_push';
         }
+
         gameState.finalStatus = dbStatus;
         await client.query("UPDATE interactive_game_sessions SET status = $1, final_payout_lamports = $2, game_state_json = $3 WHERE session_id = $4", [dbStatus, finalPayout.toString(), JSON.stringify(gameState), sessionId]);
         await client.query(`NOTIFY game_completed, '${JSON.stringify({ session_id: sessionId })}'`);
         await client.query('COMMIT');
-        if(gameState.lastMessageId) { await bot.deleteMessage(liveSession.chat_id, gameState.lastMessageId).catch(()=>{}); }
+        if(gameState.lastMessageId) { // Still relevant for Darts 501
+            await bot.deleteMessage(liveSession.chat_id, gameState.lastMessageId).catch(()=>{});
+        }
     } catch (e) { if(client) await client.query('ROLLBACK'); console.error(`[FinalizeGame SID:${sessionId}] Error: ${e.message}`); } finally { if(client) client.release(); }
 }
 
@@ -506,16 +428,15 @@ bot.on('callback_query', async (callbackQuery) => {
     }
     const session = res.rows[0];
 
+    // This logic is now primarily for Darts 501
     if (action === 'interactive_cashout') {
         await bot.answerCallbackQuery(callbackQuery.id, { text: "Cashing out..." }).catch(() => {});
         await finalizeGame(session, 'completed_cashout');
     } else if (action === 'interactive_continue') {
         await bot.answerCallbackQuery(callbackQuery.id).catch(() => {});
-        const gameType = session.game_type;
-        if (gameType === 'bowling') { await handleKingpinsChallengeContinue(session); }
-        else if (gameType === 'basketball') { await handleRoundBasedHoopsContinue(session); }
-        else if (gameType === 'darts') { await handleBullseyeBlitzContinue(session); }
-        else if (gameType === 'darts_501') { await handleDarts501Continue(session); }
+        if (session.game_type === 'darts_501') {
+            await handleDarts501Continue(session);
+        }
     }
 });
 async function handleGameTimeout(sessionId) {
@@ -533,9 +454,12 @@ async function handleNotification(msg) {
             if (res.rows.length > 0) await handleGameStart(res.rows[0]);
         } else if (msg.channel === 'interactive_roll_submitted' && sessionId) {
             const res = await pool.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [sessionId]);
-            if (res.rows.length > 0) {
+            if (res.rows.length > 0 && res.rows[0].status === 'in_progress') {
                 const lastRoll = res.rows[0].game_state_json?.lastRoll;
-                if (typeof lastRoll === 'number') { await handleRollSubmitted(res.rows[0], lastRoll); }
+                if (typeof lastRoll === 'number') {
+                    // This now handles both PvP and PvB rolls
+                    await handleRollSubmitted(res.rows[0], lastRoll);
+                }
             }
         }
     } catch (e) { console.error('[Helper] Error processing notification payload:', e); }
@@ -579,7 +503,7 @@ function getCleanGameNameHelper(gameType) {
     if (lt === 'bowling') return "Kingpin's Challenge";
     if (lt === 'darts') return "Bullseye Blitz";
     if (lt === 'darts_501') return "Darts 501 Challenge";
-    if (lt === 'basketball') return "Round-Based Hoops";
+    if (lt === 'basketball') return "3-Point Hoops";
     return "Game";
 }
 function getGameEmoji(gameType) { if (gameType.includes('bowling')) return '🎳'; if (gameType.includes('darts')) return '🎯'; if (gameType.includes('basketball')) return '🏀'; return '🎲'; }
