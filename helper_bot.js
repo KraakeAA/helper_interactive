@@ -1,4 +1,4 @@
-// helper_bot.js - FINAL UNIFIED VERSION v23 - New Darts 501 Challenge
+// helper_bot.js - FINAL UNIFIED VERSION v24 - Performance-Based Darts
 
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
@@ -33,13 +33,15 @@ const NEW_BOWLING_FRAMES = 5;
 const NEW_BOWLING_PINS_PER_ROLL = { 5: 8, 4: 7, 3: 5, 2: 3 };
 const NEW_BOWLING_MULTIPLIERS = { STRIKE: 1.75, SPARE: 1.40, OPEN: 0.85 };
 
-// NEW: Darts 501 Challenge (PvB) Game Constants
-const DARTS_501_START_SCORE = 501;
-const DARTS_501_VISIT_LIMIT = 7;
-const DARTS_501_THROWS_PER_VISIT = 3;
-const DARTS_501_POINTS_PER_ROLL = { 6: 60, 5: 50, 4: 40, 3: 20, 2: 7, 1: 1 };
-const DARTS_501_MULTIPLIER_TIERS = { '2-100': 5.00, '101-170': 3.50, '171-250': 2.00, '251-350': 1.25 };
-const DARTS_501_JACKPOT_MULTIPLIER = 10.00;
+// NEW: Performance-Based Darts 501 Challenge (PvB) Constants
+const DARTS_PERF_START_SCORE = 501;
+const DARTS_PERF_VISIT_LIMIT = 8;
+const DARTS_PERF_THROWS_PER_VISIT = 2;
+const DARTS_PERF_POINTS_PER_ROLL = { 6: 60, 5: 50, 4: 40, 3: 20, 2: 7, 1: 1 };
+const DARTS_PERF_PAR_SCORE_PER_VISIT = 65; // The "Pro" pace to beat
+const DARTS_PERF_MULTIPLIER_GAIN = 0.15;  // Multiplier gain per 10 points ahead of par
+const DARTS_PERF_MULTIPLIER_LOSS = 0.10; // Multiplier loss per 10 points behind par
+const DARTS_PERF_JACKPOT_MULTIPLIER = 10.00;
 
 // Round-Based Basketball (PvB) Game Constants
 const ROUND_BASED_HOOPS_ROUNDS = 5;
@@ -50,9 +52,6 @@ const ROUND_BASED_HOOPS_EFFECTS = { 6: { multiplier_effect: 1.8 }, 5: { multipli
 const PVP_BOWLING_FRAMES = 3;
 const PVP_BASKETBALL_SHOTS = 5;
 const PVP_DARTS_THROWS = 3;
-const THREE_POINT_PAYOUTS = [1.5, 2.2, 3.5, 5.0, 10.0, 20.0, 50.0];
-const PINPOINT_BOWLING_PAYOUT_MULTIPLIER = 5.5;
-const DARTS_FORTUNE_PAYOUTS = { 6: 3.5, 5: 1.5, 4: 0.5, 3: 0.2, 2: 0.1, 1: 0.0 };
 
 
 // --- Database & Bot Setup ---
@@ -81,12 +80,7 @@ async function runRoundBasedHoops(session) {
         gameState.status = 'awaiting_shots';
         await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
         await updateRoundBasedHoopsMessage(session.session_id);
-    } catch (e) {
-        console.error(`${logPrefix} Error starting game: ${e.message}`);
-        await finalizeGame(session, 'error');
-    } finally {
-        if (client) client.release();
-    }
+    } catch (e) { console.error(`${logPrefix} Error starting game: ${e.message}`); await finalizeGame(session, 'error'); } finally { if (client) client.release(); }
 }
 async function updateRoundBasedHoopsMessage(sessionId) {
     const logPrefix = `[UpdateRoundBasedHoopsMsg SID:${sessionId}]`;
@@ -174,12 +168,7 @@ async function runKingpinsChallenge(session) {
         gameState.status = 'awaiting_first_shot';
         await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
         await updateKingpinsChallengeMessage(session.session_id);
-    } catch (e) {
-        console.error(`${logPrefix} Error starting game: ${e.message}`);
-        await finalizeGame(session, 'error');
-    } finally {
-        if (client) client.release();
-    }
+    } catch (e) { console.error(`${logPrefix} Error starting game: ${e.message}`); await finalizeGame(session, 'error'); } finally { if (client) client.release(); }
 }
 async function updateKingpinsChallengeMessage(sessionId) {
     const logPrefix = `[UpdateKingpinsMsg SID:${sessionId}]`;
@@ -224,77 +213,67 @@ async function updateKingpinsChallengeMessage(sessionId) {
     } catch (e) { console.error(`${logPrefix} Error: ${e.message}`); } finally { if (client) client.release(); }
 }
 async function handleKingpinsChallengeRoll(session, rollValue) {
-    const logPrefix = `[HandleKingpinsRoll SID:${session.session_id}]`;
     const gameState = session.game_state_json;
-    let client = null;
-    try {
-        client = await pool.connect();
-        if (rollValue === 1) { await finalizeGame(session, 'completed_loss'); return; }
-        if (gameState.shotsInCurrentFrame === 0) {
-            if (rollValue === 6) {
-                gameState.currentMultiplier *= NEW_BOWLING_MULTIPLIERS.STRIKE;
-                gameState.frameHistory.push({ frame: gameState.currentFrame, result: 'Strike 💎', rolls: [6], frameMultiplier: NEW_BOWLING_MULTIPLIERS.STRIKE });
-                if (gameState.currentFrame >= NEW_BOWLING_FRAMES) { await finalizeGame(session, 'completed_cashout'); } else {
-                    gameState.currentFrame++;
-                    gameState.status = 'awaiting_cashout_decision';
-                    await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
-                    await updateKingpinsChallengeMessage(session.session_id);
-                }
-            } else {
-                gameState.shotsInCurrentFrame = 1;
-                gameState.pinsFromFirstShot = NEW_BOWLING_PINS_PER_ROLL[rollValue] || 0;
-                gameState.firstRollValue = rollValue;
-                gameState.status = 'awaiting_second_shot';
-                await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
-                await queuedSendMessage(session.chat_id, `Shot 1: ${gameState.pinsFromFirstShot} pins! Send another 🎳 to complete the frame.`, { disable_notification: true }).then(msg => {
-                    setTimeout(() => bot.deleteMessage(session.chat_id, msg.message_id).catch(() => {}), 4000);
-                });
-            }
-        } else if (gameState.shotsInCurrentFrame === 1) {
-            const pinsFromSecondShot = NEW_BOWLING_PINS_PER_ROLL[rollValue] || 0;
-            const totalPins = gameState.pinsFromFirstShot + pinsFromSecondShot;
-            const rolls = [gameState.firstRollValue, rollValue];
-            let result, frameMultiplier;
-            if (totalPins >= 10) { result = 'Spare ⭐'; frameMultiplier = NEW_BOWLING_MULTIPLIERS.SPARE; } else { result = 'Open Frame'; frameMultiplier = NEW_BOWLING_MULTIPLIERS.OPEN; }
-            gameState.currentMultiplier *= frameMultiplier;
-            gameState.frameHistory.push({ frame: gameState.currentFrame, result, rolls, frameMultiplier });
-            gameState.shotsInCurrentFrame = 0;
-            gameState.pinsFromFirstShot = 0;
+    if (rollValue === 1) { await finalizeGame(session, 'completed_loss'); return; }
+    if (gameState.shotsInCurrentFrame === 0) {
+        if (rollValue === 6) {
+            gameState.currentMultiplier *= NEW_BOWLING_MULTIPLIERS.STRIKE;
+            gameState.frameHistory.push({ frame: gameState.currentFrame, result: 'Strike 💎', rolls: [6], frameMultiplier: NEW_BOWLING_MULTIPLIERS.STRIKE });
             if (gameState.currentFrame >= NEW_BOWLING_FRAMES) { await finalizeGame(session, 'completed_cashout'); } else {
                 gameState.currentFrame++;
                 gameState.status = 'awaiting_cashout_decision';
-                await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
+                await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
                 await updateKingpinsChallengeMessage(session.session_id);
             }
+        } else {
+            gameState.shotsInCurrentFrame = 1;
+            gameState.pinsFromFirstShot = NEW_BOWLING_PINS_PER_ROLL[rollValue] || 0;
+            gameState.firstRollValue = rollValue;
+            gameState.status = 'awaiting_second_shot';
+            await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
+            await queuedSendMessage(session.chat_id, `Shot 1: ${gameState.pinsFromFirstShot} pins! Send another 🎳 to complete the frame.`, { disable_notification: true }).then(msg => {
+                setTimeout(() => bot.deleteMessage(session.chat_id, msg.message_id).catch(() => {}), 4000);
+            });
         }
-    } catch (e) { console.error(`${logPrefix} Error processing roll: ${e.message}`); } finally { if (client) client.release(); }
+    } else if (gameState.shotsInCurrentFrame === 1) {
+        const pinsFromSecondShot = NEW_BOWLING_PINS_PER_ROLL[rollValue] || 0;
+        const totalPins = gameState.pinsFromFirstShot + pinsFromSecondShot;
+        const rolls = [gameState.firstRollValue, rollValue];
+        let result, frameMultiplier;
+        if (totalPins >= 10) { result = 'Spare ⭐'; frameMultiplier = NEW_BOWLING_MULTIPLIERS.SPARE; } else { result = 'Open Frame'; frameMultiplier = NEW_BOWLING_MULTIPLIERS.OPEN; }
+        gameState.currentMultiplier *= frameMultiplier;
+        gameState.frameHistory.push({ frame: gameState.currentFrame, result, rolls, frameMultiplier });
+        gameState.shotsInCurrentFrame = 0;
+        gameState.pinsFromFirstShot = 0;
+        if (gameState.currentFrame >= NEW_BOWLING_FRAMES) { await finalizeGame(session, 'completed_cashout'); } else {
+            gameState.currentFrame++;
+            gameState.status = 'awaiting_cashout_decision';
+            await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
+            await updateKingpinsChallengeMessage(session.session_id);
+        }
+    }
 }
 
-// --- Darts 501 Challenge (PvB) Game Logic ---
-async function runDarts501Challenge(session) {
-    const logPrefix = `[RunDarts501 SID:${session.session_id}]`;
-    console.log(`${logPrefix} Starting Darts 501 Challenge logic.`);
+// --- Performance-Based Darts 501 Challenge (PvB) Game Logic ---
+async function runPerformanceDarts(session) {
+    const logPrefix = `[RunPerfDarts SID:${session.session_id}]`;
+    console.log(`${logPrefix} Starting Performance Darts 501 Challenge logic.`);
     let client = null;
     try {
         client = await pool.connect();
         const gameState = session.game_state_json || {};
-        gameState.remainingScore = DARTS_501_START_SCORE;
+        gameState.remainingScore = DARTS_PERF_START_SCORE;
         gameState.currentVisit = 1;
         gameState.throwsInVisit = 0;
         gameState.visitHistory = [];
         gameState.currentMultiplier = 1.0;
         gameState.status = 'awaiting_throw';
         await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
-        await updateDarts501Message(session.session_id);
-    } catch (e) {
-        console.error(`${logPrefix} Error starting game: ${e.message}`);
-        await finalizeGame(session, 'error');
-    } finally {
-        if (client) client.release();
-    }
+        await updatePerformanceDartsMessage(session.session_id);
+    } catch (e) { console.error(`${logPrefix} Error starting game: ${e.message}`); await finalizeGame(session, 'error'); } finally { if (client) client.release(); }
 }
-async function updateDarts501Message(sessionId, lastVisitResult = null) {
-    const logPrefix = `[UpdateDarts501Msg SID:${sessionId}]`;
+async function updatePerformanceDartsMessage(sessionId, lastVisitResult = null) {
+    const logPrefix = `[UpdatePerfDartsMsg SID:${sessionId}]`;
     let client = null;
     try {
         client = await pool.connect();
@@ -305,51 +284,43 @@ async function updateDarts501Message(sessionId, lastVisitResult = null) {
         if (activeTurnTimeouts.has(sessionId)) { clearTimeout(activeTurnTimeouts.get(sessionId)); activeTurnTimeouts.delete(sessionId); }
         if (gameState.lastMessageId) { await bot.deleteMessage(session.chat_id, gameState.lastMessageId).catch(() => {}); }
 
-        // Determine current multiplier based on score
-        let currentMultiplier = 1.0;
-        if (gameState.remainingScore > 0) {
-            for (const range in DARTS_501_MULTIPLIER_TIERS) {
-                const [min, max] = range.split('-').map(Number);
-                if (gameState.remainingScore >= min && gameState.remainingScore <= max) {
-                    currentMultiplier = DARTS_501_MULTIPLIER_TIERS[range];
-                    break;
-                }
-            }
-        }
-        gameState.currentMultiplier = currentMultiplier;
-
+        // --- DYNAMIC MULTIPLIER CALCULATION ---
+        const parScoreForThisStage = DARTS_PERF_START_SCORE - ((gameState.currentVisit - 1) * DARTS_PERF_PAR_SCORE_PER_VISIT);
+        const scoreDifference = parScoreForThisStage - gameState.remainingScore;
+        const tenPointIntervals = Math.round(scoreDifference / 10);
+        let multiplierBonus = 0;
+        if (tenPointIntervals > 0) { multiplierBonus = tenPointIntervals * DARTS_PERF_MULTIPLIER_GAIN; }
+        else { multiplierBonus = tenPointIntervals * DARTS_PERF_MULTIPLIER_LOSS; } // This will be negative if behind par
+        gameState.currentMultiplier = 1.0 + multiplierBonus;
+        
         const betDisplayUSD = await formatBalanceForDisplay(session.bet_amount_lamports, 'USD');
         const currentPayout = (BigInt(session.bet_amount_lamports) * BigInt(Math.floor(gameState.currentMultiplier * 100))) / 100n;
         const currentPayoutDisplay = await formatBalanceForDisplay(currentPayout, 'USD');
 
         let titleHTML = `🎯 <b>Darts 501 Challenge</b> 🎯\nPlayer: <b>${escape(gameState.p1Name)}</b> | Wager: <b>${escape(betDisplayUSD)}</b>\n`;
-        titleHTML += `<b>Visits Remaining: ${DARTS_501_VISIT_LIMIT - gameState.currentVisit + 1} / ${DARTS_501_VISIT_LIMIT}</b>\n\n`;
-
+        titleHTML += `<b>Visits Remaining: ${DARTS_PERF_VISIT_LIMIT - gameState.currentVisit + 1} / ${DARTS_PERF_VISIT_LIMIT}</b>\n\n`;
         let bodyHTML = ``;
         if (lastVisitResult) {
-            if (lastVisitResult.isBust) {
-                bodyHTML += `<i>Last Visit: BUST! Throws <b>[${lastVisitResult.rolls.join(', ')}]</b> exceeded score. No points deducted.</i>\n`;
-            } else {
-                bodyHTML += `<i>Last Visit: Throws <b>[${lastVisitResult.rolls.join(', ')}]</b> scored <b>${lastVisitResult.score}</b> points!</i>\n`;
-            }
+            if (lastVisitResult.isBust) { bodyHTML += `<i>Last Visit: BUST! Throws <b>[${lastVisitResult.rolls.join(', ')}]</b> exceeded score. No points deducted.</i>\n`; }
+            else { bodyHTML += `<i>Last Visit: Throws <b>[${lastVisitResult.rolls.join(', ')}]</b> scored <b>${lastVisitResult.score}</b> points!</i>\n`; }
         }
         bodyHTML += `Score Remaining: <b>${gameState.remainingScore}</b>\n`;
-        bodyHTML += `Total Multiplier: <b>x${gameState.currentMultiplier.toFixed(2)}</b> | Current Payout: <b>${escape(currentPayoutDisplay)}</b>\n\n`;
+        bodyHTML += `Multiplier (vs Par): <b>x${gameState.currentMultiplier.toFixed(2)}</b> | Payout: <b>${escape(currentPayoutDisplay)}</b>\n\n`;
 
         const keyboardRows = [];
         let promptHTML = "";
 
         if (gameState.status === 'awaiting_cashout_decision') {
-            promptHTML = `<i>Visit ${gameState.currentVisit - 1} complete. What's the play?</i>`;
+            promptHTML = `<i>Visit ${gameState.currentVisit - 1} complete. Your performance has been evaluated. What's the play?</i>`;
             keyboardRows.push(
                 [{ text: `💰 Cash Out (${escape(currentPayoutDisplay)})`, callback_data: `interactive_cashout:${sessionId}` }],
                 [{ text: `▶️ Throw Next Darts`, callback_data: `interactive_continue:${sessionId}` }]
             );
         } else {
-            const throwsNeeded = DARTS_501_THROWS_PER_VISIT - gameState.throwsInVisit;
-            promptHTML = `<i>Visit ${gameState.currentVisit}/${DARTS_501_VISIT_LIMIT}. Send <b>${throwsNeeded}</b> 🎯 to throw.</i>`;
+            const throwsNeeded = DARTS_PERF_THROWS_PER_VISIT - gameState.throwsInVisit;
+            promptHTML = `<i>Visit ${gameState.currentVisit}/${DARTS_PERF_VISIT_LIMIT}. Send <b>${throwsNeeded}</b> 🎯 to throw.</i>`;
         }
-
+        
         const fullMessage = `${titleHTML}${bodyHTML}${promptHTML}`;
         const sentMsg = await queuedSendMessage(session.chat_id, fullMessage, { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboardRows } });
         if (sentMsg) {
@@ -360,8 +331,7 @@ async function updateDarts501Message(sessionId, lastVisitResult = null) {
         }
     } catch (e) { console.error(`${logPrefix} Error: ${e.message}`); } finally { if (client) client.release(); }
 }
-async function handleDarts501Throw(session, rollValue) {
-    const logPrefix = `[HandleDarts501 SID:${session.session_id}]`;
+async function handlePerformanceDartsThrow(session, rollValue) {
     const gameState = session.game_state_json;
     if (gameState.status !== 'awaiting_throw') return;
 
@@ -369,20 +339,20 @@ async function handleDarts501Throw(session, rollValue) {
     if (!gameState.currentVisitThrows) gameState.currentVisitThrows = [];
     gameState.currentVisitThrows.push(rollValue);
 
-    if (gameState.throwsInVisit >= DARTS_501_THROWS_PER_VISIT) {
-        const scoreThisVisit = gameState.currentVisitThrows.reduce((sum, roll) => sum + (DARTS_501_POINTS_PER_ROLL[roll] || 0), 0);
+    if (gameState.throwsInVisit >= DARTS_PERF_THROWS_PER_VISIT) {
+        const scoreThisVisit = gameState.currentVisitThrows.reduce((sum, roll) => sum + (DARTS_PERF_POINTS_PER_ROLL[roll] || 0), 0);
         let lastVisitResult = { rolls: gameState.currentVisitThrows, score: scoreThisVisit, isBust: false };
+        const scoreAfterThrow = gameState.remainingScore - scoreThisVisit;
 
-        if (gameState.remainingScore - scoreThisVisit === 0) { // WIN
-            gameState.currentMultiplier = DARTS_501_JACKPOT_MULTIPLIER;
+        if (scoreAfterThrow === 0) { // WIN
+            gameState.currentMultiplier = DARTS_PERF_JACKPOT_MULTIPLIER;
             await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
             await finalizeGame(session, 'completed_cashout');
             return;
-        } else if (gameState.remainingScore - scoreThisVisit < 0 || gameState.remainingScore - scoreThisVisit === 1) { // BUST
+        } else if (scoreAfterThrow < 0 || scoreAfterThrow === 1) { // BUST
             lastVisitResult.isBust = true;
-            // No score change, just proceed to next turn
         } else { // Valid score
-            gameState.remainingScore -= scoreThisVisit;
+            gameState.remainingScore = scoreAfterThrow;
         }
 
         gameState.visitHistory.push(lastVisitResult);
@@ -390,23 +360,13 @@ async function handleDarts501Throw(session, rollValue) {
         gameState.throwsInVisit = 0;
         gameState.currentVisitThrows = [];
 
-        if (gameState.currentVisit > DARTS_501_VISIT_LIMIT) { // LOSE (out of time)
-            await finalizeGame(session, 'completed_loss');
-            return;
-        }
+        if (gameState.currentVisit > DARTS_PERF_VISIT_LIMIT) { await finalizeGame(session, 'completed_loss'); return; }
 
-        // Cashout is available from visit 2 onwards
-        if (gameState.currentVisit > 1 && gameState.remainingScore <= 350) {
-             gameState.status = 'awaiting_cashout_decision';
-        } else {
-             gameState.status = 'awaiting_throw'; // Auto-continue if no cashout option yet
-        }
-       
+        gameState.status = gameState.currentVisit > 1 ? 'awaiting_cashout_decision' : 'awaiting_throw';
+        
         await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
-        await updateDarts501Message(session.session_id, lastVisitResult);
-
+        await updatePerformanceDartsMessage(session.session_id, lastVisitResult);
     } else {
-        // Silently update state and wait for more throws
         await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
     }
 }
@@ -441,18 +401,12 @@ async function handleGameStart(session) {
         await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), liveSession.session_id]);
         await client.query('COMMIT');
 
-        // Route to the appropriate game loop
         if (gameType === 'basketball') { await runRoundBasedHoops(liveSession); } 
         else if (gameType === 'bowling' && !isNewPvPDuel) { await runKingpinsChallenge(liveSession); }
-        else if (gameType === 'darts' && !isNewPvPDuel) { await runDarts501Challenge(liveSession); }
+        else if (gameType === 'darts' && !isNewPvPDuel) { await runPerformanceDarts(liveSession); }
         else if (isNewPvPDuel) { await advancePvPGameState(liveSession.session_id); }
         else { console.error(`${logPrefix} Unknown game type to start: ${gameType}`); await finalizeGame(liveSession, 'error'); }
-    } catch (e) {
-        if (client) await client.query('ROLLBACK');
-        console.error(`${logPrefix} Error initializing game: ${e.message}`);
-    } finally {
-        if (client) client.release();
-    }
+    } catch (e) { if (client) await client.query('ROLLBACK'); console.error(`${logPrefix} Error initializing game: ${e.message}`); } finally { if (client) client.release(); }
 }
 async function advancePvPGameState(sessionId) {
     const logPrefix = `[AdvancePvP SID:${sessionId}]`;
@@ -471,8 +425,7 @@ async function advancePvPGameState(sessionId) {
         gameState.currentPlayerTurn = !p1_done ? String(gameState.initiatorId) : String(gameState.opponentId);
         await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), sessionId]);
         await promptPvPAction(session, gameState);
-    } catch (e) { console.error(`${logPrefix} Error: ${e.message}`); await finalizeGame({session_id: sessionId}, 'error'); }
-    finally { if (client) client.release(); }
+    } catch (e) { console.error(`${logPrefix} Error: ${e.message}`); await finalizeGame({session_id: sessionId}, 'error'); } finally { if (client) client.release(); }
 }
 async function promptPvPAction(session, gameState) {
     const { chat_id, game_type } = session;
@@ -495,12 +448,11 @@ async function handleRollSubmitted(session, lastRoll) {
         const gameType = session.game_type;
         if (gameType === 'basketball') { await handleRoundBasedHoopsRoll(session, lastRoll); }
         else if (gameType === 'bowling' && !gameType.includes('_pvp')) { await handleKingpinsChallengeRoll(session, lastRoll); }
-        else if (gameType === 'darts' && !gameType.includes('_pvp')) { await handleDarts501Throw(session, lastRoll); }
+        else if (gameType === 'darts' && !gameType.includes('_pvp')) { await handlePerformanceDartsThrow(session, lastRoll); }
         else if (gameType.includes('_pvp')) {
             const gameState = session.game_state_json || {};
-            const currentPlayerId = gameState.currentPlayerTurn;
             if (activeTurnTimeouts.has(session.session_id)) { clearTimeout(activeTurnTimeouts.get(session.session_id)); activeTurnTimeouts.delete(session.session_id); }
-            const playerKey = (String(gameState.initiatorId) === currentPlayerId) ? 'p1' : 'p2';
+            const playerKey = (String(gameState.initiatorId) === gameState.currentPlayerTurn) ? 'p1' : 'p2';
             if (!gameState[`${playerKey}Rolls`]) gameState[`${playerKey}Rolls`] = [];
             gameState[`${playerKey}Rolls`].push(lastRoll);
             await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
@@ -543,8 +495,7 @@ async function finalizeGame(session, finalStatus) {
         await client.query(`NOTIFY game_completed, '${JSON.stringify({ session_id: sessionId })}'`);
         await client.query('COMMIT');
         if(gameState.lastMessageId) { await bot.deleteMessage(liveSession.chat_id, gameState.lastMessageId).catch(()=>{}); }
-    } catch (e) { if(client) await client.query('ROLLBACK'); console.error(`${logPrefix} Error finalizing game: ${e.message}`); }
-    finally { if(client) client.release(); }
+    } catch (e) { if(client) await client.query('ROLLBACK'); console.error(`${logPrefix} Error finalizing game: ${e.message}`); } finally { if(client) client.release(); }
 }
 
 // --- EVENT HANDLERS & MAIN LOOP ---
@@ -583,7 +534,7 @@ bot.on('callback_query', async (callbackQuery) => {
             } else if (gameType === 'darts' && gameState.status === 'awaiting_cashout_decision') {
                 gameState.status = 'awaiting_throw';
                 await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
-                await updateDarts501Message(session.session_id);
+                await updatePerformanceDartsMessage(session.session_id);
             }
         }
     }
