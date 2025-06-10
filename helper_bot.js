@@ -1,4 +1,4 @@
-// helper_bot.js - FINAL UNIFIED VERSION v18 - Basketball UI with Score Log & 45s Timeout
+// helper_bot.js - FINAL UNIFIED VERSION v19 - Basketball with Round Summary
 
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
@@ -142,7 +142,7 @@ async function updateRoundBasedHoopsMessage(sessionId) {
         let bodyHTML = `Wager: <b>${escape(betDisplayUSD)}</b>\n\n`;
         
         bodyHTML += `<b>Round: ${gameState.currentRound}/${ROUND_BASED_HOOPS_ROUNDS}</b> | Multiplier: <b>x${gameState.currentMultiplier.toFixed(2)}</b>\n`;
-        bodyHTML += `Payout: <b>${escape(currentPayoutDisplay)}</b>\n\n`;
+        bodyHTML += `Current Payout: <b>${escape(currentPayoutDisplay)}</b>\n\n`;
 
         // Show the results of the last completed round for context
         if (gameState.shotsTakenInRound === 0 && gameState.rolls.length > 0) {
@@ -150,7 +150,7 @@ async function updateRoundBasedHoopsMessage(sessionId) {
             const effect1 = ROUND_BASED_HOOPS_EFFECTS[lastRoundRolls[0]];
             const effect2 = ROUND_BASED_HOOPS_EFFECTS[lastRoundRolls[1]];
             const roundMultiplier = effect1.multiplier_effect * effect2.multiplier_effect;
-            bodyHTML += `<i>Last Round [${lastRoundRolls.join(', ')}] changed multiplier by x${roundMultiplier.toFixed(2)}</i>\n\n`;
+            bodyHTML += `<i>Last Round's Shots [${lastRoundRolls.join(', ')}] changed multiplier by x${roundMultiplier.toFixed(2)}</i>\n\n`;
         }
 
         const keyboardRows = [];
@@ -567,7 +567,7 @@ bot.on('callback_query', async (callbackQuery) => {
         await bot.answerCallbackQuery(callbackQuery.id, { text: "Cashing out..." }).catch(() => {});
         const sessionId = data.split(':')[1];
         const res = await pool.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [sessionId]);
-        if (res.rowCount > 0 && res.rows[0].status === 'in_progress') {
+        if (res.rowCount > 0 && (res.rows[0].status === 'in_progress' || res.rows[0].status === 'awaiting_cashout_decision')) {
             const session = res.rows[0];
             if(String(session.user_id) !== String(callbackQuery.from.id)) return;
             await finalizeGame(session, 'completed_cashout');
