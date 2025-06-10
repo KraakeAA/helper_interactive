@@ -1,4 +1,4 @@
-// helper_bot.js - FINAL UNIFIED VERSION v31 - sendDice Implementation
+// helper_bot.js - FINAL UNIFIED VERSION v32 - Bugfix for Race Condition
 
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
@@ -15,8 +15,8 @@ const GAME_LOOP_INTERVAL = 3000;
 const PLAYER_ACTION_TIMEOUT = 45000;
 
 // --- Basic Utilities ---
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const PQueue = cjsPQueue.default ?? cjsPQueue;
+const rollDice = () => Math.floor(Math.random() * 6) + 1; // Kept as a fallback if needed
 
 // --- Price Fetching & Formatting Dependencies ---
 const SOL_DECIMALS = 9;
@@ -107,7 +107,7 @@ async function updateRoundBasedHoopsMessage(session, lastRoundInfo = null) {
 
     if (gameState.currentRound === 1 && !lastRoundInfo) {
         promptHTML = `<i>Your first round. Let's play!</i>`;
-        keyboardRows[0].shift();
+        keyboardRows.shift();
     }
 
     const fullMessage = `${titleHTML}${bodyHTML}${promptHTML}`;
@@ -120,12 +120,15 @@ async function updateRoundBasedHoopsMessage(session, lastRoundInfo = null) {
 async function handleRoundBasedHoopsContinue(session) {
     await bot.deleteMessage(session.chat_id, session.game_state_json.lastMessageId).catch(() => {});
     
-    let rolls = [];
+    const dicePromises = [];
     for (let i = 0; i < ROUND_BASED_HOOPS_SHOTS_PER_ROUND; i++) {
-        const diceMessage = await queuedSendDice(session.chat_id, '🏀');
-        if (diceMessage) rolls.push(diceMessage.dice.value);
+        dicePromises.push(queuedSendDice(session.chat_id, '🏀'));
     }
-    
+    const diceMessages = await Promise.all(dicePromises);
+
+    const rolls = diceMessages.map(msg => msg ? msg.dice.value : 1);
+    if (rolls.includes(undefined)) { await finalizeGame(session, 'error'); return; }
+
     const gameState = session.game_state_json;
     let roundMultiplier = 1.0;
     for (const roll of rolls) {
@@ -188,7 +191,7 @@ async function handleKingpinsChallengeContinue(session) {
 
     let frameResult = {};
     const diceMessage1 = await queuedSendDice(session.chat_id, '🎳');
-    if (!diceMessage1) { await finalizeGame(session, 'error'); return; }
+    if (!diceMessage1 || !diceMessage1.dice) { await finalizeGame(session, 'error'); return; }
     const roll1 = diceMessage1.dice.value;
 
     if (roll1 === 1) { await finalizeGame(session, 'completed_loss'); return; }
@@ -198,7 +201,7 @@ async function handleKingpinsChallengeContinue(session) {
         frameResult = { result: 'Strike 💎', rolls: [6] };
     } else {
         const diceMessage2 = await queuedSendDice(session.chat_id, '🎳');
-        if (!diceMessage2) { await finalizeGame(session, 'error'); return; }
+        if (!diceMessage2 || !diceMessage2.dice) { await finalizeGame(session, 'error'); return; }
         const roll2 = diceMessage2.dice.value;
 
         if (roll2 === 1) { await finalizeGame(session, 'completed_loss'); return; }
@@ -267,12 +270,15 @@ async function updateBullseyeBlitzMessage(session, lastRoundResult = null) {
 async function handleBullseyeBlitzContinue(session) {
     await bot.deleteMessage(session.chat_id, session.game_state_json.lastMessageId).catch(() => {});
 
-    let rolls = [];
+    const dicePromises = [];
     for(let i=0; i<BLITZ_DARTS_THROWS_PER_ROUND; i++) {
-        const diceMessage = await queuedSendDice(session.chat_id, '🎯');
-        if (diceMessage) rolls.push(diceMessage.dice.value);
+        dicePromises.push(queuedSendDice(session.chat_id, '🎯'));
     }
+    const diceMessages = await Promise.all(dicePromises);
     
+    const rolls = diceMessages.map(msg => msg ? msg.dice.value : 1);
+    if (rolls.includes(undefined)) { await finalizeGame(session, 'error'); return; }
+
     if (rolls.every(r => r <= BLITZ_DARTS_BUST_ROLL_MAX)) { await finalizeGame(session, 'completed_loss'); return; }
     
     const gameState = session.game_state_json;
@@ -345,11 +351,14 @@ async function updateDarts501Message(session, lastVisitResult = null) {
 async function handleDarts501Continue(session) {
     await bot.deleteMessage(session.chat_id, session.game_state_json.lastMessageId).catch(() => {});
     
-    let rolls = [];
+    const dicePromises = [];
     for(let i=0; i<DARTS_501_THROWS_PER_VISIT; i++) {
-        const diceMessage = await queuedSendDice(session.chat_id, '🎯');
-        if (diceMessage) rolls.push(diceMessage.dice.value);
+        dicePromises.push(queuedSendDice(session.chat_id, '🎯'));
     }
+    const diceMessages = await Promise.all(dicePromises);
+
+    const rolls = diceMessages.map(msg => msg ? msg.dice.value : 1);
+    if (rolls.includes(undefined)) { await finalizeGame(session, 'error'); return; }
 
     const gameState = session.game_state_json;
     const scoreThisVisit = rolls.reduce((sum, roll) => sum + (BLITZ_DARTS_POINTS_PER_ROLL[roll] || 0), 0);
