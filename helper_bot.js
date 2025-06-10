@@ -1,4 +1,4 @@
-// helper_bot.js - FINAL UNIFIED VERSION v15 - Basketball UI/Clarity Fixes, No Omissions
+// helper_bot.js - FINAL UNIFIED VERSION v16 - Basketball UI Polished, No Omissions
 
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
@@ -53,16 +53,16 @@ const THREE_POINT_PAYOUTS = [1.5, 2.2, 3.5, 5.0, 10.0, 20.0, 50.0];
 const PINPOINT_BOWLING_PAYOUT_MULTIPLIER = 5.5;
 const DARTS_FORTUNE_PAYOUTS = { 6: 3.5, 5: 1.5, 4: 0.5, 3: 0.2, 2: 0.1, 1: 0.0 };
 
-// --- NEW: Round-Based Basketball (PvB) Game Constants ---
+// --- Round-Based Basketball (PvB) Game Constants ---
 const ROUND_BASED_HOOPS_ROUNDS = 5;
 const ROUND_BASED_HOOPS_SHOTS_PER_ROUND = 2;
 const ROUND_BASED_HOOPS_EFFECTS = {
-    6: { outcome: 'Swish!', emoji: '🎯', multiplier_effect: 1.5 },   // Good positive
-    5: { outcome: 'Nice Shot!', emoji: '👍', multiplier_effect: 1.2 },   // Slight positive
-    4: { outcome: 'Rim In!', emoji: '⚪️', multiplier_effect: 1.0 },   // Neutral
-    3: { outcome: 'Rim Out!', emoji: '🟡', multiplier_effect: 0.75 },  // Negative
-    2: { outcome: 'Bad Miss!', emoji: '🟡', multiplier_effect: 0.5 },   // Negative
-    1: { outcome: 'Airball!', emoji: '💥', multiplier_effect: 0.0 }    // Bust
+    6: { outcome: 'Swish!', emoji: '🎯', multiplier_effect: 1.5 },
+    5: { outcome: 'Nice Shot!', emoji: '👍', multiplier_effect: 1.2 },
+    4: { outcome: 'Rim In!', emoji: '⚪️', multiplier_effect: 1.0 },
+    3: { outcome: 'Rim Out!', emoji: '🟡', multiplier_effect: 0.75 },
+    2: { outcome: 'Bad Miss!', emoji: '🟡', multiplier_effect: 0.5 },
+    1: { outcome: 'Airball!', emoji: '💥', multiplier_effect: 0.0 }
 };
 
 
@@ -77,7 +77,7 @@ bot.on('polling_error', (error) => console.error(`[Helper] Polling Error: ${erro
 const telegramSendQueue = new PQueue({ concurrency: 1, interval: 1000 / 20, intervalCap: 1 });
 const queuedSendMessage = (...args) => telegramSendQueue.add(() => bot.sendMessage(...args));
 
-// --- NEW: Round-Based Hoops (PvB Basketball) Game Logic ---
+// --- Round-Based Hoops (PvB Basketball) Game Logic ---
 
 /**
  * Entry point and state initializer for the Round-Based Hoops game.
@@ -91,7 +91,6 @@ async function runRoundBasedHoops(session) {
         client = await pool.connect();
         const gameState = session.game_state_json || {};
         
-        // Initialize game state for a new game
         gameState.currentRound = 1;
         gameState.shotsTakenInRound = 0;
         gameState.rolls = [];
@@ -111,7 +110,7 @@ async function runRoundBasedHoops(session) {
 }
 
 /**
- * Creates and updates the game message for Round-Based Hoops.
+ * Creates and updates the single, concise game message for Round-Based Hoops.
  * @param {number} sessionId The database ID of the session.
  */
 async function updateRoundBasedHoopsMessage(sessionId) {
@@ -139,40 +138,26 @@ async function updateRoundBasedHoopsMessage(sessionId) {
         const currentPayout = (BigInt(session.bet_amount_lamports) * BigInt(Math.floor(gameState.currentMultiplier * 100))) / 100n;
         const currentPayoutDisplay = await formatBalanceForDisplay(currentPayout, 'USD');
 
-        let titleHTML = `🏀 <b>${escape(gameName)}</b> 🏀\n\n`;
-        let bodyHTML = `Player: <b>${escape(gameState.p1Name)}</b> | Wager: <b>${escape(betDisplayUSD)}</b>\n\n`;
+        let titleHTML = `🏀 <b>${escape(gameName)}</b> | ${escape(gameState.p1Name)}\n`;
+        let bodyHTML = `Wager: <b>${escape(betDisplayUSD)}</b>\n\n`;
         
-        let progressIcons = "";
-        for (let i = 1; i <= ROUND_BASED_HOOPS_ROUNDS; i++) {
-            progressIcons += (i < gameState.currentRound) ? "✅ " : (i === gameState.currentRound ? "🎯 " : "⚪️ ");
-        }
-        bodyHTML += `Progress: ${progressIcons}\nRound: <b>${gameState.currentRound} / ${ROUND_BASED_HOOPS_ROUNDS}</b>\n\n`;
-
-        // Create the detailed shot log
-        let shotLogHTML = "<b>Shot Log:</b>\n";
-        if (gameState.rolls.length > 0) {
-            gameState.rolls.forEach((roll, index) => {
-                const roundForShot = Math.floor(index / ROUND_BASED_HOOPS_SHOTS_PER_ROUND) + 1;
-                const shotInRound = (index % ROUND_BASED_HOOPS_SHOTS_PER_ROUND) + 1;
-                const effect = ROUND_BASED_HOOPS_EFFECTS[roll];
-                shotLogHTML += `  R${roundForShot}, S${shotInRound}: Rolled <b>${roll}</b> ${effect.emoji} (${effect.outcome})\n`;
-            });
-        } else {
-            shotLogHTML += "<i>No shots taken yet.</i>\n";
-        }
-        bodyHTML += `${shotLogHTML}\n`;
-
-        bodyHTML += `Multiplier: <b>x${gameState.currentMultiplier.toFixed(2)}</b>\n`;
+        bodyHTML += `<b>Round: ${gameState.currentRound}/${ROUND_BASED_HOOPS_ROUNDS}</b> | Multiplier: <b>x${gameState.currentMultiplier.toFixed(2)}</b>\n`;
         bodyHTML += `Current Payout: <b>${escape(currentPayoutDisplay)}</b>\n\n`;
+
+        // Show the results of the last completed round for context
+        if (gameState.shotsTakenInRound === 0 && gameState.rolls.length > 0) {
+            const lastRoundRolls = gameState.rolls.slice(-ROUND_BASED_HOOPS_SHOTS_PER_ROUND);
+            bodyHTML += `<i>Last Round's Shots: ${lastRoundRolls.join(', ')}</i>\n\n`;
+        }
 
         const keyboardRows = [];
         let promptHTML = "";
 
         if (gameState.status === 'awaiting_shots') {
             const shotsRemaining = ROUND_BASED_HOOPS_SHOTS_PER_ROUND - gameState.shotsTakenInRound;
-            promptHTML = `Please send <b>${shotsRemaining}</b> 🏀 emoji(s) to take your shot(s) for Round ${gameState.currentRound}.`;
+            promptHTML = `Please send <b>${shotsRemaining}</b> 🏀 emoji(s) to play Round ${gameState.currentRound}.`;
         } else if (gameState.status === 'awaiting_cashout_decision') {
-            promptHTML = `<b>Round ${gameState.currentRound} Complete!</b>\nSend a 🏀 to start the next round, or cash out your winnings now.`;
+            promptHTML = `<b>Round ${gameState.currentRound} Complete!</b>\nSend 🏀 to start the next round, or cash out now.`;
             keyboardRows.push([
                 { text: `💰 Cash Out (${escape(currentPayoutDisplay)})`, callback_data: `interactive_cashout:${sessionId}` }
             ]);
@@ -203,7 +188,7 @@ async function handleRoundBasedHoopsRoll(session, rollValue) {
     const logPrefix = `[HandleRoundBasedHoopsRoll SID:${session.session_id}]`;
     const gameState = session.game_state_json;
 
-    // If player sends a roll when they should be cashing out/continuing, treat it as continuing.
+    // If player sends a roll when they should be making a decision, treat it as continuing.
     if (gameState.status === 'awaiting_cashout_decision') {
         gameState.currentRound++;
         gameState.shotsTakenInRound = 0; // Reset for the new round
@@ -216,12 +201,6 @@ async function handleRoundBasedHoopsRoll(session, rollValue) {
     if (!effect) {
         console.error(`${logPrefix} Invalid roll value: ${rollValue}`);
         return;
-    }
-
-    // Give immediate feedback on the roll
-    const feedbackMsg = await queuedSendMessage(session.chat_id, `You rolled a <b>${rollValue}</b>... ${effect.emoji} (${effect.outcome})`, { parse_mode: 'HTML' });
-    if(feedbackMsg) {
-        setTimeout(() => bot.deleteMessage(session.chat_id, feedbackMsg.message_id).catch(() => {}), 3000);
     }
     
     // 1. Check for instant loss
@@ -249,7 +228,6 @@ async function handleRoundBasedHoopsRoll(session, rollValue) {
     } else {
         // Round is not over, silently wait for the next roll and save state
         await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
-        // No UI update here, we wait for the second shot of the round.
     }
 }
 
@@ -578,30 +556,11 @@ bot.on('callback_query', async (callbackQuery) => {
     const data = callbackQuery.data;
     if (!data) return;
 
-    if (data.startsWith('roundbased_hoops_continue:')) {
-        await bot.answerCallbackQuery(callbackQuery.id).catch(() => {});
-        const sessionId = data.split(':')[1];
-        const res = await pool.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [sessionId]);
-        if (res.rowCount > 0) {
-            const session = res.rows[0];
-            if(String(session.user_id) !== String(callbackQuery.from.id)) return;
-            // Treat this as the user wanting to continue; the next roll emoji will advance the state.
-            // We just need to update the prompt.
-            const gameState = session.game_state_json;
-            gameState.currentRound++;
-            gameState.shotsTakenInRound = 0;
-            gameState.status = 'awaiting_shots';
-            await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), sessionId]);
-            await updateRoundBasedHoopsMessage(sessionId);
-        }
-        return;
-    }
-
-    if (data && data.startsWith('interactive_cashout:')) {
+    if (data.startsWith('interactive_cashout:')) {
         await bot.answerCallbackQuery(callbackQuery.id, { text: "Cashing out..." }).catch(() => {});
         const sessionId = data.split(':')[1];
         const res = await pool.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [sessionId]);
-        if (res.rowCount > 0 && res.rows[0].status === 'in_progress') {
+        if (res.rowCount > 0) { // Removed status check to allow cashing out from any state as a failsafe
             const session = res.rows[0];
             if(String(session.user_id) !== String(callbackQuery.from.id)) return;
             await finalizeGame(session, 'completed_cashout');
