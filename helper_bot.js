@@ -1,4 +1,4 @@
-// helper_bot.js - FINAL UNIFIED VERSION v11 - All Logic & Functions Included, No Omissions
+// helper_bot.js - FINAL UNIFIED VERSION v13 - Round-Based Basketball Implemented, No Omissions
 
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
@@ -53,14 +53,16 @@ const THREE_POINT_PAYOUTS = [1.5, 2.2, 3.5, 5.0, 10.0, 20.0, 50.0];
 const PINPOINT_BOWLING_PAYOUT_MULTIPLIER = 5.5;
 const DARTS_FORTUNE_PAYOUTS = { 6: 3.5, 5: 1.5, 4: 0.5, 3: 0.2, 2: 0.1, 1: 0.0 };
 
-// --- NEW: Hot Streak Hoops (PvB Basketball) Game Constants ---
-const HOT_STREAK_HOOPS_EFFECTS = {
-    6: { outcome: 'Swish! 🎯', multiplier_increase: 1.8 },
-    5: { outcome: 'Nice Shot! 👍', multiplier_increase: 1.3 },
-    4: { outcome: 'Rim In! ⚪️', multiplier_increase: 1.0 }, // Neutral
-    3: { outcome: 'Rim Out! 🟡', multiplier_increase: 0.5 }, // Penalty
-    2: { outcome: 'Airball! 💥', multiplier_increase: 0.0 },  // Bust
-    1: { outcome: 'Airball! 💥', multiplier_increase: 0.0 }   // Bust
+// --- NEW: Round-Based Basketball (PvB) Game Constants ---
+const ROUND_BASED_HOOPS_ROUNDS = 5;
+const ROUND_BASED_HOOPS_SHOTS_PER_ROUND = 2;
+const ROUND_BASED_HOOPS_EFFECTS = {
+    6: { outcome: 'Swish! 🎯', multiplier_effect: 1.5 },   // Good positive
+    5: { outcome: 'Nice Shot! 👍', multiplier_effect: 1.2 },   // Slight positive
+    4: { outcome: 'Rim In! ⚪️', multiplier_effect: 1.0 },   // Neutral
+    3: { outcome: 'Rim Out! 🟡', multiplier_effect: 0.75 },  // Negative
+    2: { outcome: 'Bad Miss! 🟡', multiplier_effect: 0.5 },   // Negative
+    1: { outcome: 'Airball! 💥', multiplier_effect: 0.0 }    // Bust
 };
 
 
@@ -75,29 +77,30 @@ bot.on('polling_error', (error) => console.error(`[Helper] Polling Error: ${erro
 const telegramSendQueue = new PQueue({ concurrency: 1, interval: 1000 / 20, intervalCap: 1 });
 const queuedSendMessage = (...args) => telegramSendQueue.add(() => bot.sendMessage(...args));
 
-// --- NEW: Hot Streak Hoops (PvB Basketball) Game Logic ---
+// --- NEW: Round-Based Hoops (PvB Basketball) Game Logic ---
 
 /**
- * Entry point and state initializer for the Hot Streak Hoops game.
+ * Entry point and state initializer for the Round-Based Hoops game.
  * @param {object} session The game session data from the database.
  */
-async function runHotStreakHoops(session) {
-    const logPrefix = `[RunHotStreak SID:${session.session_id}]`;
-    console.log(`${logPrefix} Starting Hot Streak Hoops logic.`);
+async function runRoundBasedHoops(session) {
+    const logPrefix = `[RunRoundBasedHoops SID:${session.session_id}]`;
+    console.log(`${logPrefix} Starting Round-Based Hoops logic.`);
     let client = null;
     try {
         client = await pool.connect();
         const gameState = session.game_state_json || {};
         
         // Initialize game state for a new game
-        gameState.turn = 1;
+        gameState.currentRound = 1;
+        gameState.shotsTakenInRound = 0;
         gameState.rolls = [];
         gameState.currentMultiplier = 1.0;
-        gameState.status = 'awaiting_roll';
+        gameState.status = 'awaiting_shots';
 
         await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
         
-        await updateHotStreakHoopsMessage(session.session_id);
+        await updateRoundBasedHoopsMessage(session.session_id);
 
     } catch (e) {
         console.error(`${logPrefix} Error starting game: ${e.message}`);
@@ -108,11 +111,11 @@ async function runHotStreakHoops(session) {
 }
 
 /**
- * Creates and updates the game message for Hot Streak Hoops.
+ * Creates and updates the game message for Round-Based Hoops.
  * @param {number} sessionId The database ID of the session.
  */
-async function updateHotStreakHoopsMessage(sessionId) {
-    const logPrefix = `[UpdateHotStreakMsg SID:${sessionId}]`;
+async function updateRoundBasedHoopsMessage(sessionId) {
+    const logPrefix = `[UpdateRoundBasedHoopsMsg SID:${sessionId}]`;
     let client = null;
     try {
         client = await pool.connect();
@@ -132,26 +135,31 @@ async function updateHotStreakHoopsMessage(sessionId) {
         }
 
         const betDisplayUSD = await formatBalanceForDisplay(session.bet_amount_lamports, 'USD');
-        const gameName = "Hot Streak Hoops";
+        const gameName = "Round-Based Hoops";
         const currentPayout = (BigInt(session.bet_amount_lamports) * BigInt(Math.floor(gameState.currentMultiplier * 100))) / 100n;
         const currentPayoutDisplay = await formatBalanceForDisplay(currentPayout, 'USD');
 
         let titleHTML = `🏀 <b>${escape(gameName)}</b> 🏀\n\n`;
         let bodyHTML = `Player: <b>${escape(gameState.p1Name)}</b> | Wager: <b>${escape(betDisplayUSD)}</b>\n\n`;
         
-        let rollsDisplay = gameState.rolls.length > 0 ? gameState.rolls.map(r => `<b>${r}</b>`).join(' → ') : '...';
-        bodyHTML += `Rolls: ${rollsDisplay}\n`;
+        let progressIcons = "";
+        for (let i = 1; i <= ROUND_BASED_HOOPS_ROUNDS; i++) {
+            progressIcons += (i < gameState.currentRound) ? "✅ " : (i === gameState.currentRound ? "🎯 " : "⚪️ ");
+        }
+        bodyHTML += `Progress: ${progressIcons}\nRound: <b>${gameState.currentRound} / ${ROUND_BASED_HOOPS_ROUNDS}</b>\n\n`;
         bodyHTML += `Multiplier: <b>x${gameState.currentMultiplier.toFixed(2)}</b>\n`;
         bodyHTML += `Current Payout: <b>${escape(currentPayoutDisplay)}</b>\n\n`;
 
         const keyboardRows = [];
-        let promptHTML = `It's your turn! Send a 🏀 to take your shot!`;
-        
-        // Only show cashout/next shot if they have made at least one successful roll
-        if(gameState.rolls.length > 0) {
-            promptHTML = `What's your next move?`;
+        let promptHTML = "";
+
+        if (gameState.status === 'awaiting_shots') {
+            const shotsRemaining = ROUND_BASED_HOOPS_SHOTS_PER_ROUND - gameState.shotsTakenInRound;
+            promptHTML = `Please send <b>${shotsRemaining}</b> 🏀 emoji(s) to take your shot(s) for this round.`;
+        } else if (gameState.status === 'awaiting_cashout_decision') {
+            promptHTML = `Round ${gameState.currentRound} complete! Continue to the next round or cash out now.`;
             keyboardRows.push([
-                { text: `🏀 Next Shot`, callback_data: `interactive_roll_request:${sessionId}` },
+                { text: `▶️ Continue to Round ${gameState.currentRound + 1}`, callback_data: `roundbased_hoops_continue:${sessionId}` },
                 { text: `💰 Cash Out (${escape(currentPayoutDisplay)})`, callback_data: `interactive_cashout:${sessionId}` }
             ]);
         }
@@ -173,40 +181,77 @@ async function updateHotStreakHoopsMessage(sessionId) {
 }
 
 /**
- * Handles a player's roll in Hot Streak Hoops.
+ * Handles a player's roll in Round-Based Hoops.
  * @param {object} session The game session data.
  * @param {number} rollValue The value of the dice roll.
  */
-async function handleHotStreakHoopsRoll(session, rollValue) {
-    const logPrefix = `[HandleHotStreakRoll SID:${session.session_id}]`;
+async function handleRoundBasedHoopsRoll(session, rollValue) {
+    const logPrefix = `[HandleRoundBasedHoopsRoll SID:${session.session_id}]`;
     const gameState = session.game_state_json;
 
-    if (gameState.status !== 'awaiting_roll') return;
+    if (gameState.status !== 'awaiting_shots') return;
 
-    const effect = HOT_STREAK_HOOPS_EFFECTS[rollValue];
+    const effect = ROUND_BASED_HOOPS_EFFECTS[rollValue];
     if (!effect) {
         console.error(`${logPrefix} Invalid roll value: ${rollValue}`);
         return;
     }
 
-    // Check for bust
-    if (effect.multiplier_increase === 0.0) {
+    // 1. Check for instant loss
+    if (effect.multiplier_effect === 0.0) {
         await finalizeGame(session, 'completed_loss'); // Bust
         return;
     }
 
-    // Update state
+    // 2. Update state with the new roll
     gameState.rolls.push(rollValue);
-    gameState.currentMultiplier = (gameState.currentMultiplier * effect.multiplier_increase);
-    gameState.turn++;
-    
-    await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
-    
-    // Update the message to show new state and offer choices
-    await updateHotStreakHoopsMessage(session.session_id);
+    gameState.shotsTakenInRound++;
+    gameState.currentMultiplier = (gameState.currentMultiplier * effect.multiplier_effect);
+
+    // 3. Check if the round is complete
+    if (gameState.shotsTakenInRound >= ROUND_BASED_HOOPS_SHOTS_PER_ROUND) {
+        // If this was the final round, cash out automatically
+        if (gameState.currentRound >= ROUND_BASED_HOOPS_ROUNDS) {
+            await finalizeGame(session, 'completed_cashout');
+        } else {
+            // Otherwise, prompt for decision
+            gameState.status = 'awaiting_cashout_decision';
+            await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
+            await updateRoundBasedHoopsMessage(session.session_id);
+        }
+    } else {
+        // Round is not over, silently wait for the next roll
+        await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
+    }
 }
 
-// --- End of NEW Hot Streak Hoops Logic ---
+async function handleRoundBasedHoopsContinue(sessionId) {
+    const logPrefix = `[HandleHoopsContinue SID:${sessionId}]`;
+    let client = null;
+    try {
+        client = await pool.connect();
+        const res = await client.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [sessionId]);
+        if (res.rowCount === 0 || res.rows[0].game_state_json.status !== 'awaiting_cashout_decision') return;
+
+        const session = res.rows[0];
+        const gameState = session.game_state_json;
+
+        gameState.currentRound++;
+        gameState.shotsTakenInRound = 0;
+        gameState.status = 'awaiting_shots';
+
+        await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), sessionId]);
+        await updateRoundBasedHoopsMessage(sessionId);
+
+    } catch (e) {
+        console.error(`${logPrefix} Error: ${e.message}`);
+    } finally {
+        if (client) client.release();
+    }
+}
+
+// --- End of NEW Round-Based Hoops Logic ---
+
 
 // --- GAME ENGINE & STATE MACHINE ---
 
@@ -237,7 +282,7 @@ async function handleGameStart(session) {
         const isNewPvPDuel = gameType.includes('_pvp');
         
         if (gameType === 'basketball') {
-            // Initialization is handled within runHotStreakHoops
+            // Initialization is handled within runRoundBasedHoops
         } else if (isPressYourLuck) {
             gameState.turn = 1;
             gameState.rolls = [];
@@ -257,7 +302,7 @@ async function handleGameStart(session) {
 
         // --- NOW, call the appropriate game loop AFTER committing ---
         if (gameType === 'basketball') {
-            await runHotStreakHoops(liveSession);
+            await runRoundBasedHoops(liveSession);
         } else if (isPressYourLuck) {
             await updateKingpinChallengeState(liveSession.session_id);
         } else if (isNewPvPDuel) {
@@ -422,7 +467,7 @@ async function handleRollSubmitted(session, lastRoll) {
         }
 
         if (session.game_type === 'basketball') {
-            await handleHotStreakHoopsRoll(session, lastRoll);
+            await handleRoundBasedHoopsRoll(session, lastRoll);
             return; 
         }
         
@@ -476,22 +521,17 @@ async function finalizeGame(session, finalStatus) {
         let dbStatus = finalStatus;
         let finalPayout = 0n;
 
-        // Logic for basketball game finalization
-        if (liveSession.game_type === 'basketball') {
-            if (finalStatus === 'completed_win') {
-                dbStatus = 'completed_win';
+        if (liveSession.game_type === 'basketball') {
+            if (finalStatus === 'completed_win' || finalStatus === 'completed_cashout') {
+                dbStatus = finalStatus; 
                 const multiplier = gameState.currentMultiplier || 0;
-                const profit = (BigInt(liveSession.bet_amount_lamports) * BigInt(Math.floor(multiplier * 100)) / 100n) - BigInt(liveSession.bet_amount_lamports);
-                finalPayout = BigInt(liveSession.bet_amount_lamports) + profit;
-            } else if (finalStatus === 'completed_cashout') {
-                dbStatus = 'completed_cashout';
-                finalPayout = (BigInt(liveSession.bet_amount_lamports) * BigInt(Math.floor(gameState.currentMultiplier * 100))) / 100n;
-            } else { // bust, timeout, loss
-                dbStatus = 'completed_loss';
-                finalPayout = 0n;
-            }
-            gameState.finalStatus = dbStatus;
-        } 
+                finalPayout = (BigInt(liveSession.bet_amount_lamports) * BigInt(Math.floor(multiplier * 100))) / 100n;
+            } else { // bust, timeout, error
+                dbStatus = 'completed_loss';
+                finalPayout = 0n;
+            }
+            gameState.finalStatus = dbStatus;
+        } 
         else if (finalStatus === 'pvp_resolve') {
             const p1Score = calculateFinalScore(liveSession.game_type, gameState.p1Rolls);
             const p2Score = calculateFinalScore(liveSession.game_type, gameState.p2Rolls);
@@ -535,17 +575,10 @@ bot.on('callback_query', async (callbackQuery) => {
     const data = callbackQuery.data;
     if (!data) return;
 
-    if (data.startsWith('interactive_roll_request:')) {
+    if (data.startsWith('roundbased_hoops_continue:')) {
         await bot.answerCallbackQuery(callbackQuery.id).catch(() => {});
         const sessionId = data.split(':')[1];
-        const sessionRes = await pool.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [sessionId]);
-        if (sessionRes.rowCount > 0) {
-            const session = sessionRes.rows[0];
-            if(String(session.user_id) !== String(callbackQuery.from.id)) return;
-            // The user clicking this button *is* the roll request.
-            // The main bot's message handler will catch the dice emoji and call the helper.
-            await queuedSendMessage(session.chat_id, `Okay, ${escape(session.game_state_json.p1Name)}! Send a 🏀 emoji to take your next shot.`);
-        }
+        await handleRoundBasedHoopsContinue(sessionId);
         return;
     }
 
@@ -638,10 +671,10 @@ async function fetchSolUsdPriceFromCoinGeckoAPI() { try { const response = await
 async function getSolUsdPrice() { const cached = solPriceCache.get(SOL_PRICE_CACHE_KEY); if (cached && (Date.now() - cached.timestamp < SOL_USD_PRICE_CACHE_TTL_MS)) return cached.price; try { const price = await fetchSolUsdPriceFromBinanceAPI(); solPriceCache.set(SOL_PRICE_CACHE_KEY, { price, timestamp: Date.now() }); return price; } catch (e) { try { const price = await fetchSolUsdPriceFromCoinGeckoAPI(); solPriceCache.set(SOL_PRICE_CACHE_KEY, { price, timestamp: Date.now() }); return price; } catch (e2) { if (cached) return cached.price; throw new Error("Could not retrieve SOL/USD price from any source."); } }}
 function convertLamportsToUSDString(lamports, solUsdPrice, d = 2) { if (typeof solUsdPrice !== 'number' || solUsdPrice <= 0) return 'N/A'; const sol = Number(BigInt(lamports)) / Number(LAMPORTS_PER_SOL); return `$${(sol * solUsdPrice).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d })}`;}
 async function formatBalanceForDisplay(lamports, currency = 'USD') { if (currency === 'USD') { try { const price = await getSolUsdPrice(); return convertLamportsToUSDString(lamports, price); } catch (e) { return 'N/A'; } } return `${(Number(BigInt(lamports)) / Number(LAMPORTS_PER_SOL)).toFixed(SOL_DECIMALS)} SOL`;}
-function getPressYourLuckConfig(gameType) { switch(gameType) { case 'bowling': return { maxTurns: BOWLING_FRAMES, effects: KINGPIN_ROLL_EFFECTS, emoji: '🎳' }; case 'darts': return { maxTurns: DARTS_THROWS_TOTAL, effects: BULLSEYE_BLITZ_EFFECTS, emoji: '🎯' }; case 'basketball': return { maxTurns: BASKETBALL_SHOTS_TOTAL, effects: HOT_STREAK_HOOPS_EFFECTS, emoji: '🏀' }; default: return { maxTurns: 1, effects: {}, emoji: '🎲' }; }}
+function getPressYourLuckConfig(gameType) { switch(gameType) { case 'bowling': return { maxTurns: BOWLING_FRAMES, effects: KINGPIN_ROLL_EFFECTS, emoji: '🎳' }; case 'darts': return { maxTurns: DARTS_THROWS_TOTAL, effects: BULLSEYE_BLITZ_EFFECTS, emoji: '🎯' }; case 'basketball': return { maxTurns: Infinity, effects: ROUND_BASED_HOOPS_EFFECTS, emoji: '🏀' }; default: return { maxTurns: 1, effects: {}, emoji: '🎲' }; }}
 function getShotsPerPlayer(gameType) { const lt = String(gameType).toLowerCase(); if (lt.includes('bowling_duel_pvp')) return PVP_BOWLING_FRAMES; if (lt.includes('basketball_clash_pvp')) return PVP_BASKETBALL_SHOTS; if (lt.includes('darts_duel_pvp')) return PVP_DARTS_THROWS; return 1; }
 function calculateFinalScore(gameType, rolls) { const safeRolls = rolls || []; if (safeRolls.length === 0) return 0; if (gameType.includes('basketball')) return safeRolls.filter(r => r >= 4).length; return safeRolls.reduce((a, b) => a + b, 0); }
-function getCleanGameNameHelper(gameType) { if (!gameType) return "Game"; const lt = String(gameType).toLowerCase(); if (lt.includes('bowling_duel_pvp')) return "Bowling Duel"; if (lt.includes('darts_duel_pvp')) return "Darts Showdown"; if (lt.includes('basketball_clash_pvp')) return "3-Point Clash"; if (lt === 'bowling') return "Kingpin's Challenge"; if (lt === 'darts') return "Bullseye Blitz"; if (lt === 'basketball') return "Hot Streak Hoops"; return "Game"; }
+function getCleanGameNameHelper(gameType) { if (!gameType) return "Game"; const lt = String(gameType).toLowerCase(); if (lt.includes('bowling_duel_pvp')) return "Bowling Duel"; if (lt.includes('darts_duel_pvp')) return "Darts Showdown"; if (lt.includes('basketball_clash_pvp')) return "3-Point Clash"; if (lt === 'bowling') return "Kingpin's Challenge"; if (lt === 'darts') return "Bullseye Blitz"; if (lt === 'basketball') return "Round-Based Hoops"; return "Game"; }
 function getGameEmoji(gameType) { if (gameType.includes('bowling')) return '🎳'; if (gameType.includes('darts')) return '🎯'; if (gameType.includes('basketball')) return '🏀'; return '🎲'; }
 function formatRollsHelper(rolls) { if (!rolls || rolls.length === 0) return '...'; return rolls.map(r => `<b>${r}</b>`).join(' '); }
 
