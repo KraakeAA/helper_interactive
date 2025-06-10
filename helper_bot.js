@@ -1,4 +1,4 @@
-// helper_bot.js - FINAL UNIFIED VERSION v19 - Basketball UI with Final Results Fix
+// helper_bot.js - FINAL UNIFIED VERSION v20 - Re-balanced Basketball Payouts
 
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
@@ -56,13 +56,14 @@ const DARTS_FORTUNE_PAYOUTS = { 6: 3.5, 5: 1.5, 4: 0.5, 3: 0.2, 2: 0.1, 1: 0.0 }
 // --- Round-Based Basketball (PvB) Game Constants ---
 const ROUND_BASED_HOOPS_ROUNDS = 5;
 const ROUND_BASED_HOOPS_SHOTS_PER_ROUND = 2;
+// RE-BALANCED MULTIPLIERS FOR FAIRER GAMEPLAY
 const ROUND_BASED_HOOPS_EFFECTS = {
-    6: { outcome: 'Swish!', emoji: '🎯', multiplier_effect: 1.5 },
-    5: { outcome: 'Nice Shot!', emoji: '👍', multiplier_effect: 1.2 },
-    4: { outcome: 'Rim In!', emoji: '⚪️', multiplier_effect: 1.0 },
-    3: { outcome: 'Rim Out!', emoji: '🟡', multiplier_effect: 0.75 },
-    2: { outcome: 'Bad Miss!', emoji: '🟡', multiplier_effect: 0.5 },
-    1: { outcome: 'Airball!', emoji: '💥', multiplier_effect: 0.0 }
+    6: { outcome: 'Swish!', emoji: '🎯', multiplier_effect: 1.8 },      // Great positive
+    5: { outcome: 'Nice Shot!', emoji: '👍', multiplier_effect: 1.3 },      // Good positive
+    4: { outcome: 'Rim In!', emoji: '⚪️', multiplier_effect: 1.1 },      // Slight positive
+    3: { outcome: 'Rim Out!', emoji: '🟡', multiplier_effect: 1.0 },      // Neutral
+    2: { outcome: 'Bad Miss!', emoji: '🟡', multiplier_effect: 0.9 },      // Slight Penalty
+    1: { outcome: 'Airball!', emoji: '💥', multiplier_effect: 0.0 }       // Bust
 };
 
 
@@ -567,25 +568,6 @@ async function finalizeGame(session, finalStatus) {
 bot.on('callback_query', async (callbackQuery) => {
     const data = callbackQuery.data;
     if (!data) return;
-
-    if (data.startsWith('roundbased_hoops_continue:')) {
-        await bot.answerCallbackQuery(callbackQuery.id).catch(() => {});
-        const sessionId = data.split(':')[1];
-        const res = await pool.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [sessionId]);
-        if (res.rowCount > 0) {
-            const session = res.rows[0];
-            if(String(session.user_id) !== String(callbackQuery.from.id)) return;
-            // The roll handler will see the status and advance the round.
-            // We just need to prompt the user again.
-            const gameState = session.game_state_json;
-            gameState.shotsTakenInRound = 0;
-            gameState.currentRound++;
-            gameState.status = 'awaiting_shots';
-            await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), sessionId]);
-            await updateRoundBasedHoopsMessage(sessionId);
-        }
-        return;
-    }
 
     if (data && data.startsWith('interactive_cashout:')) {
         await bot.answerCallbackQuery(callbackQuery.id, { text: "Cashing out..." }).catch(() => {});
