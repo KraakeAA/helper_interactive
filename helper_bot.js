@@ -1,4 +1,4 @@
-// helper_bot.js - FINAL UNIFIED VERSION v19 - Basketball with Round Summary
+// helper_bot.js - FINAL UNIFIED VERSION v19 - Basketball UI with Final Results Fix
 
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
@@ -145,12 +145,14 @@ async function updateRoundBasedHoopsMessage(sessionId) {
         bodyHTML += `Current Payout: <b>${escape(currentPayoutDisplay)}</b>\n\n`;
 
         // Show the results of the last completed round for context
-        if (gameState.shotsTakenInRound === 0 && gameState.rolls.length > 0) {
+        if (gameState.status === 'awaiting_cashout_decision' && gameState.rolls.length > 0) {
             const lastRoundRolls = gameState.rolls.slice(-ROUND_BASED_HOOPS_SHOTS_PER_ROUND);
-            const effect1 = ROUND_BASED_HOOPS_EFFECTS[lastRoundRolls[0]];
-            const effect2 = ROUND_BASED_HOOPS_EFFECTS[lastRoundRolls[1]];
-            const roundMultiplier = effect1.multiplier_effect * effect2.multiplier_effect;
-            bodyHTML += `<i>Last Round's Shots [${lastRoundRolls.join(', ')}] changed multiplier by x${roundMultiplier.toFixed(2)}</i>\n\n`;
+            if (lastRoundRolls.length === 2) {
+                const effect1 = ROUND_BASED_HOOPS_EFFECTS[lastRoundRolls[0]];
+                const effect2 = ROUND_BASED_HOOPS_EFFECTS[lastRoundRolls[1]];
+                const roundMultiplier = effect1.multiplier_effect * effect2.multiplier_effect;
+                bodyHTML += `<i>Last Round's Shots [${lastRoundRolls.join(', ')}] changed multiplier by x${roundMultiplier.toFixed(2)}</i>\n\n`;
+            }
         }
 
         const keyboardRows = [];
@@ -211,6 +213,9 @@ async function handleRoundBasedHoopsRoll(session, rollValue) {
     
     // 1. Check for instant loss
     if (effect.multiplier_effect === 0.0) {
+        // Add the losing roll to the history before finalizing
+        gameState.rolls.push(rollValue);
+        await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
         await finalizeGame(session, 'completed_loss'); // Bust
         return;
     }
@@ -563,11 +568,30 @@ bot.on('callback_query', async (callbackQuery) => {
     const data = callbackQuery.data;
     if (!data) return;
 
+    if (data.startsWith('roundbased_hoops_continue:')) {
+        await bot.answerCallbackQuery(callbackQuery.id).catch(() => {});
+        const sessionId = data.split(':')[1];
+        const res = await pool.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [sessionId]);
+        if (res.rowCount > 0) {
+            const session = res.rows[0];
+            if(String(session.user_id) !== String(callbackQuery.from.id)) return;
+            // The roll handler will see the status and advance the round.
+            // We just need to prompt the user again.
+            const gameState = session.game_state_json;
+            gameState.shotsTakenInRound = 0;
+            gameState.currentRound++;
+            gameState.status = 'awaiting_shots';
+            await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), sessionId]);
+            await updateRoundBasedHoopsMessage(sessionId);
+        }
+        return;
+    }
+
     if (data && data.startsWith('interactive_cashout:')) {
         await bot.answerCallbackQuery(callbackQuery.id, { text: "Cashing out..." }).catch(() => {});
         const sessionId = data.split(':')[1];
         const res = await pool.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [sessionId]);
-        if (res.rowCount > 0 && (res.rows[0].status === 'in_progress' || res.rows[0].status === 'awaiting_cashout_decision')) {
+        if (res.rowCount > 0 && (res.rows[0].status === 'in_progress' || res.rows[0].game_state_json.status === 'awaiting_cashout_decision')) {
             const session = res.rows[0];
             if(String(session.user_id) !== String(callbackQuery.from.id)) return;
             await finalizeGame(session, 'completed_cashout');
