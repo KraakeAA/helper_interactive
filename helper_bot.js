@@ -1,4 +1,4 @@
-// helper_bot.js - FINAL UNIFIED VERSION v26 - Visual Auto-Roll Implemented
+// helper_bot.js - FINAL UNIFIED VERSION v29 - UI Polish & Final Adjustments
 
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
@@ -12,8 +12,9 @@ const HELPER_BOT_TOKEN = process.env.HELPER_BOT_TOKEN;
 const DATABASE_URL = process.env.DATABASE_URL;
 const MY_BOT_ID = process.env.HELPER_BOT_ID || 'HelperBot_1';
 const GAME_LOOP_INTERVAL = 3000;
-const PLAYER_ACTION_TIMEOUT = 45000; // 45-second timeout for a player's turn
-const VISUAL_ROLL_DELAY = 2000; // 2-second delay for the "play out" animation
+const PLAYER_ACTION_TIMEOUT = 45000;
+const INTER_EMOJI_DELAY = 750; // Delay between sending multiple emojis
+const FINAL_REVEAL_DELAY = 1500; // Delay after last emoji before showing result
 
 // --- Basic Utilities ---
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -73,20 +74,17 @@ bot.on('polling_error', (error) => console.error(`[Helper] Polling Error: ${erro
 // API Failsafe Queue: Process max 1 message every 3.5 seconds to stay under the 20 msg/min/group limit.
 const telegramSendQueue = new PQueue({ concurrency: 1, interval: 3500, intervalCap: 1 });
 const queuedSendMessage = (...args) => telegramSendQueue.add(() => bot.sendMessage(...args).catch(console.error));
-const queuedEditMessage = (...args) => telegramSendQueue.add(() => bot.editMessageText(...args).catch(console.error));
 
 
 // --- Round-Based Hoops (PvB Basketball) Game Logic ---
 async function runRoundBasedHoops(session) {
     const gameState = session.game_state_json || {};
     gameState.currentRound = 1;
-    gameState.rolls = [];
     gameState.currentMultiplier = 1.0;
-    gameState.status = 'awaiting_decision';
     await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
     await updateRoundBasedHoopsMessage(session);
 }
-async function updateRoundBasedHoopsMessage(session, lastRoundRolls = null) {
+async function updateRoundBasedHoopsMessage(session, lastRoundInfo = null) {
     const res = await pool.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [session.session_id]);
     if (res.rowCount === 0) return;
     const liveSession = res.rows[0];
@@ -99,17 +97,20 @@ async function updateRoundBasedHoopsMessage(session, lastRoundRolls = null) {
     
     let titleHTML = `🏀 <b>Round-Based Hoops</b> | ${escape(gameState.p1Name)}\n`;
     let bodyHTML = `Wager: <b>${escape(betDisplayUSD)}</b>\n\n`;
-    if (lastRoundRolls) { bodyHTML += `<i>Last Round's Shots: ${rolls.join(', ')}</i>\n`; }
+    if (lastRoundInfo) { bodyHTML += `<i>Last Round's Shots: ${lastRoundInfo.rolls.join(', ')} (Multiplier x${lastRoundInfo.multiplier.toFixed(2)})</i>\n`; }
     bodyHTML += `<b>Round: ${gameState.currentRound}/${ROUND_BASED_HOOPS_ROUNDS}</b> | Multiplier: <b>x${gameState.currentMultiplier.toFixed(2)}</b>\n`;
     bodyHTML += `Current Payout: <b>${escape(currentPayoutDisplay)}</b>\n\n`;
     
     let promptHTML = `<i>Round ${gameState.currentRound}. Ready to shoot?</i>`;
-    const keyboardRows = [[
-        { text: `💰 Cash Out (${currentPayoutDisplay})`, callback_data: `interactive_cashout:${liveSession.session_id}` },
-        { text: `▶️ Shoot Hoops`, callback_data: `interactive_continue:${liveSession.session_id}` }
-    ]];
+    const keyboardRows = [
+        [{ text: `💰 Cash Out (${currentPayoutDisplay})`, callback_data: `interactive_cashout:${liveSession.session_id}` }],
+        [{ text: `🏀 Shoot Hoops`, callback_data: `interactive_continue:${liveSession.session_id}` }]
+    ];
 
-    if (gameState.currentRound === 1 && !lastRoundRolls) { promptHTML = `<i>Your first round. Let's play!</i>`; keyboardRows[0].shift(); }
+    if (gameState.currentRound === 1 && !lastRoundInfo) {
+        promptHTML = `<i>Your first round. Let's play!</i>`;
+        keyboardRows.shift(); // Remove cashout button on first turn
+    }
 
     const fullMessage = `${titleHTML}${bodyHTML}${promptHTML}`;
     const sentMsg = await queuedSendMessage(liveSession.chat_id, fullMessage, { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboardRows } });
@@ -119,10 +120,18 @@ async function updateRoundBasedHoopsMessage(session, lastRoundRolls = null) {
     }
 }
 async function handleRoundBasedHoopsContinue(session) {
-    const { chat_id, game_state_json: gameState } = session;
-    await queuedEditMessage("Taking the shots...\n`🏀... 🏀...`", { chat_id, message_id: gameState.lastMessageId, parse_mode: 'Markdown' });
-    await sleep(VISUAL_ROLL_DELAY);
-    
+    const { chat_id } = session;
+    const emoji = getGameEmoji('basketball');
+    let sentMessages = [];
+    for(let i=0; i<ROUND_BASED_HOOPS_SHOTS_PER_ROUND; i++) {
+        const msg = await queuedSendMessage(chat_id, emoji);
+        if(msg) sentMessages.push(msg.message_id);
+        await sleep(INTER_EMOJI_DELAY);
+    }
+    await sleep(FINAL_REVEAL_DELAY);
+    sentMessages.forEach(id => bot.deleteMessage(chat_id, id).catch(() => {}));
+
+    const gameState = session.game_state_json;
     const rolls = [rollDice(), rollDice()];
     let roundMultiplier = 1.0;
     for (const roll of rolls) {
@@ -135,7 +144,7 @@ async function handleRoundBasedHoopsContinue(session) {
     if (gameState.currentRound > ROUND_BASED_HOOPS_ROUNDS) { await finalizeGame(session, 'completed_cashout'); }
     else {
         await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
-        await updateRoundBasedHoopsMessage(session, rolls);
+        await updateRoundBasedHoopsMessage(session, { rolls, multiplier: roundMultiplier });
     }
 }
 
@@ -143,9 +152,7 @@ async function handleRoundBasedHoopsContinue(session) {
 async function runKingpinsChallenge(session) {
     const gameState = session.game_state_json || {};
     gameState.currentFrame = 1;
-    gameState.frameHistory = [];
     gameState.currentMultiplier = 1.0;
-    gameState.status = 'awaiting_decision';
     await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
     await updateKingpinsChallengeMessage(session);
 }
@@ -165,11 +172,14 @@ async function updateKingpinsChallengeMessage(session, lastFrameResult = null) {
     bodyHTML += `Total Multiplier: <b>x${gameState.currentMultiplier.toFixed(2)}</b> | Payout: <b>${escape(currentPayoutDisplay)}</b>\n\n`;
     
     let promptHTML = `<i>Frame ${gameState.currentFrame}/${NEW_BOWLING_FRAMES}. Ready to bowl?</i>`;
-    const keyboardRows = [[
-        { text: `💰 Cash Out (${currentPayoutDisplay})`, callback_data: `interactive_cashout:${liveSession.session_id}` },
-        { text: `▶️ Bowl Next Frame`, callback_data: `interactive_continue:${liveSession.session_id}` }
-    ]];
-    if (gameState.currentFrame === 1 && !lastFrameResult) { promptHTML = `<i>Your first frame. Good luck!</i>`; keyboardRows[0].shift(); }
+    const keyboardRows = [
+        [{ text: `💰 Cash Out (${currentPayoutDisplay})`, callback_data: `interactive_cashout:${liveSession.session_id}` }],
+        [{ text: `🎳 Bowl Next Frame`, callback_data: `interactive_continue:${liveSession.session_id}` }]
+    ];
+    if (gameState.currentFrame === 1 && !lastFrameResult) {
+        promptHTML = `<i>Your first frame. Good luck!</i>`;
+        keyboardRows.shift();
+    }
     
     const fullMessage = `${titleHTML}${bodyHTML}${promptHTML}`;
     const sentMsg = await queuedSendMessage(liveSession.chat_id, fullMessage, { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboardRows } });
@@ -180,18 +190,28 @@ async function updateKingpinsChallengeMessage(session, lastFrameResult = null) {
 }
 async function handleKingpinsChallengeContinue(session) {
     const { chat_id, game_state_json: gameState } = session;
-    await queuedEditMessage("Ball is rolling...\n`💨... 🎳...`", { chat_id, message_id: gameState.lastMessageId, parse_mode: 'Markdown' });
-    await sleep(VISUAL_ROLL_DELAY);
+    const emoji = getGameEmoji('bowling');
+    let sentMessages = [];
+
+    const msg1 = await queuedSendMessage(chat_id, emoji);
+    if(msg1) sentMessages.push(msg1.message_id);
+    await sleep(INTER_EMOJI_DELAY);
 
     let frameResult = {};
     const roll1 = rollDice();
-    if (roll1 === 1) { await finalizeGame(session, 'completed_loss'); return; }
+    if (roll1 === 1) { sentMessages.forEach(id => bot.deleteMessage(chat_id, id).catch(() => {})); await finalizeGame(session, 'completed_loss'); return; }
+    
     if (roll1 === 6) {
         gameState.currentMultiplier *= NEW_BOWLING_MULTIPLIERS.STRIKE;
         frameResult = { result: 'Strike 💎', rolls: [6] };
     } else {
+        const msg2 = await queuedSendMessage(chat_id, emoji);
+        if(msg2) sentMessages.push(msg2.message_id);
+        await sleep(INTER_EMOJI_DELAY);
+
         const roll2 = rollDice();
-        if (roll2 === 1) { await finalizeGame(session, 'completed_loss'); return; }
+        if (roll2 === 1) { sentMessages.forEach(id => bot.deleteMessage(chat_id, id).catch(() => {})); await finalizeGame(session, 'completed_loss'); return; }
+        
         const pinsFromFirstShot = NEW_BOWLING_PINS_PER_ROLL[roll1] || 0;
         const pinsFromSecondShot = NEW_BOWLING_PINS_PER_ROLL[roll2] || 0;
         if ((pinsFromFirstShot + pinsFromSecondShot) >= 10) {
@@ -202,7 +222,10 @@ async function handleKingpinsChallengeContinue(session) {
             frameResult = { result: 'Open Frame', rolls: [roll1, roll2] };
         }
     }
-    gameState.frameHistory.push(frameResult);
+    
+    await sleep(FINAL_REVEAL_DELAY);
+    sentMessages.forEach(id => bot.deleteMessage(chat_id, id).catch(() => {}));
+
     gameState.currentFrame++;
     if (gameState.currentFrame > NEW_BOWLING_FRAMES) { await finalizeGame(session, 'completed_cashout'); }
     else {
@@ -217,7 +240,6 @@ async function runBullseyeBlitz(session) {
     gameState.currentRound = 1;
     gameState.totalScore = 0;
     gameState.currentMultiplier = 1.0;
-    gameState.status = 'awaiting_decision';
     await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
     await updateBullseyeBlitzMessage(session);
 }
@@ -238,11 +260,14 @@ async function updateBullseyeBlitzMessage(session, lastRoundResult = null) {
     bodyHTML += `Current Payout: <b>${escape(currentPayoutDisplay)}</b>\n\n`;
     
     let promptHTML = `<i>Round ${gameState.currentRound}/${BLITZ_DARTS_ROUNDS}. Ready to throw?</i>`;
-    const keyboardRows = [[
-        { text: `💰 Cash Out (${currentPayoutDisplay})`, callback_data: `interactive_cashout:${liveSession.session_id}` },
-        { text: `▶️ Throw Darts`, callback_data: `interactive_continue:${liveSession.session_id}` }
-    ]];
-    if (gameState.currentRound === 1 && !lastRoundResult) { promptHTML = `<i>Your first round. Go for the bullseye!</i>`; keyboardRows[0].shift(); }
+    const keyboardRows = [
+        [{ text: `💰 Cash Out (${currentPayoutDisplay})`, callback_data: `interactive_cashout:${liveSession.session_id}` }],
+        [{ text: `🎯 Throw Darts`, callback_data: `interactive_continue:${liveSession.session_id}` }]
+    ];
+    if (gameState.currentRound === 1 && !lastRoundResult) {
+        promptHTML = `<i>Your first round. Go for the bullseye!</i>`;
+        keyboardRows.shift();
+    }
     
     const fullMessage = `${titleHTML}${bodyHTML}${promptHTML}`;
     const sentMsg = await queuedSendMessage(liveSession.chat_id, fullMessage, { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboardRows } });
@@ -253,9 +278,16 @@ async function updateBullseyeBlitzMessage(session, lastRoundResult = null) {
 }
 async function handleBullseyeBlitzContinue(session) {
     const { chat_id, game_state_json: gameState } = session;
-    await queuedEditMessage("Throwing Darts...\n`🎯... 🎯...`", { chat_id, message_id: gameState.lastMessageId, parse_mode: 'Markdown' });
-    await sleep(VISUAL_ROLL_DELAY);
-    
+    const emoji = getGameEmoji('darts');
+    let sentMessages = [];
+    for(let i=0; i<BLITZ_DARTS_THROWS_PER_ROUND; i++) {
+        const msg = await queuedSendMessage(chat_id, emoji);
+        if(msg) sentMessages.push(msg.message_id);
+        await sleep(INTER_EMOJI_DELAY);
+    }
+    await sleep(FINAL_REVEAL_DELAY);
+    sentMessages.forEach(id => bot.deleteMessage(chat_id, id).catch(() => {}));
+
     const rolls = [rollDice(), rollDice()];
     if (rolls.every(r => r <= BLITZ_DARTS_BUST_ROLL_MAX)) { await finalizeGame(session, 'completed_loss'); return; }
     
@@ -278,9 +310,7 @@ async function runDarts501Challenge(session) {
     const gameState = session.game_state_json || {};
     gameState.remainingScore = DARTS_501_START_SCORE;
     gameState.currentVisit = 1;
-    gameState.visitHistory = [];
     gameState.currentMultiplier = 1.0;
-    gameState.status = 'awaiting_decision';
     await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
     await updateDarts501Message(session);
 }
@@ -312,11 +342,13 @@ async function updateDarts501Message(session, lastVisitResult = null) {
     bodyHTML += `Multiplier (vs Par): <b>x${gameState.currentMultiplier.toFixed(2)}</b> | Payout: <b>${escape(currentPayoutDisplay)}</b>\n\n`;
 
     let promptHTML = `<i>Visit ${gameState.currentVisit}/${DARTS_501_VISIT_LIMIT}. Ready to throw?</i>`;
-    const keyboardRows = [[
-        { text: `💰 Cash Out (${currentPayoutDisplay})`, callback_data: `interactive_cashout:${liveSession.session_id}` },
-        { text: `▶️ Throw Next Darts`, callback_data: `interactive_continue:${liveSession.session_id}` }
-    ]];
-    if (gameState.currentVisit === 1) { keyboardRows[0].shift(); }
+    const keyboardRows = [
+        [{ text: `💰 Cash Out (${currentPayoutDisplay})`, callback_data: `interactive_cashout:${liveSession.session_id}` }],
+        [{ text: `🎯 Throw Next Visit`, callback_data: `interactive_continue:${liveSession.session_id}` }]
+    ];
+    if (gameState.currentVisit === 1) {
+        keyboardRows.shift();
+    }
     
     const fullMessage = `${titleHTML}${bodyHTML}${promptHTML}`;
     const sentMsg = await queuedSendMessage(liveSession.chat_id, fullMessage, { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboardRows } });
@@ -327,8 +359,15 @@ async function updateDarts501Message(session, lastVisitResult = null) {
 }
 async function handleDarts501Continue(session) {
     const { chat_id, game_state_json: gameState } = session;
-    await queuedEditMessage("Throwing Darts...\n`🎯... 🎯...`", { chat_id, message_id: gameState.lastMessageId, parse_mode: 'Markdown' });
-    await sleep(VISUAL_ROLL_DELAY);
+    const emoji = getGameEmoji('darts_501');
+    let sentMessages = [];
+    for(let i=0; i<DARTS_501_THROWS_PER_VISIT; i++) {
+        const msg = await queuedSendMessage(chat_id, emoji);
+        if(msg) sentMessages.push(msg.message_id);
+        await sleep(INTER_EMOJI_DELAY);
+    }
+    await sleep(FINAL_REVEAL_DELAY);
+    sentMessages.forEach(id => bot.deleteMessage(chat_id, id).catch(() => {}));
     
     const rolls = [rollDice(), rollDice()];
     const scoreThisVisit = rolls.reduce((sum, roll) => sum + (BLITZ_DARTS_POINTS_PER_ROLL[roll] || 0), 0);
@@ -346,7 +385,6 @@ async function handleDarts501Continue(session) {
         gameState.remainingScore = scoreAfterThrow;
     }
 
-    gameState.visitHistory.push(lastVisitResult);
     gameState.currentVisit++;
 
     if (gameState.currentVisit > DARTS_501_VISIT_LIMIT) { await finalizeGame(session, 'completed_loss'); return; }
