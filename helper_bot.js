@@ -218,7 +218,7 @@ async function handlePvBRoll(session, playerRollValue) {
             botResult.points = DARTS_501_POINTS_PER_ROLL[botRollValue] || 0;
         }
         
-        // 3. Update Game State
+        // 3. Update Game State (in memory)
         gameState.playerRolls.push(playerRollValue);
         gameState.botRolls.push(botRollValue);
         gameState.playerScore += playerResult.points;
@@ -237,17 +237,17 @@ async function handlePvBRoll(session, playerRollValue) {
 
         // 5. Proceed to next step
         if (isGameOver) {
-            await finalizeGame(session, 'pvb_resolve');
+            // FIX: Pass the updated gameState directly to finalizeGame to avoid using stale data
+            await finalizeGame(session, 'pvb_resolve', gameState);
         } else {
             gameState.currentTurn++;
+            // Save state and prompt for the next turn
             await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
             await promptPvBAction(session);
         }
     } catch (error) {
-        // If any of the `await` calls fail (like sending a message), this block will catch it.
         console.error(`[handlePvBRoll] Error during bot's turn: ${error.message}. Finalizing game with error state.`);
-        // Finalize the game with an error, which will trigger a refund on the main bot.
-        await finalizeGame(session, 'error');
+        await finalizeGame(session, 'error', gameState); // Pass current state even on error
     }
 }
 
@@ -335,9 +335,9 @@ async function handleRollSubmitted(session, lastRoll) {
         await handlePvBRoll(session, lastRoll);
     }
 }
-async function finalizeGame(session, finalStatus) {
+async function finalizeGame(session, finalStatus, updatedGameState = null) {
     const sessionId = session.session_id;
-    const logPrefix = `[FinalizeGame_V2 SID:${sessionId}]`;
+    const logPrefix = `[FinalizeGame_V3_StateFix SID:${sessionId}]`;
 
     if (activeTurnTimeouts.has(sessionId)) { 
         clearTimeout(activeTurnTimeouts.get(sessionId));
@@ -349,24 +349,23 @@ async function finalizeGame(session, finalStatus) {
         client = await pool.connect();
         await client.query('BEGIN');
 
-        const liveSessionRes = await client.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1 FOR UPDATE", [sessionId]);
-        if(liveSessionRes.rowCount === 0 || liveSessionRes.rows[0].status !== 'in_progress') {
-            console.log(`${logPrefix} Game already finalized or not in progress. Aborting.`);
-            await client.query('ROLLBACK'); 
-            return; 
-        }
+        // FIX: Use the passed session data directly instead of re-fetching, to avoid race conditions.
+        const liveSession = session;
         
-        const liveSession = liveSessionRes.rows[0];
-        const gameState = liveSession.game_state_json;
+        // FIX: Use the up-to-date gameState passed from the caller, which contains the final turn's score.
+        // Fallback to the session's stored state if no updated state was passed.
+        const gameState = updatedGameState || liveSession.game_state_json;
+        
         let dbStatus = finalStatus;
-
-        // Determine final status based on game logic, but DO NOT calculate lamports here.
+        
+        // This logic block now correctly uses the final scores from `gameState`
         if (finalStatus === 'pvb_resolve') {
-            if ((liveSession.game_type === 'bowling' || liveSession.game_type === 'darts') && gameState.playerScore === gameState.botScore) {
+            const { p1Name, playerScore, botScore } = gameState;
+            if ((liveSession.game_type === 'bowling' || liveSession.game_type === 'darts') && playerScore === botScore) {
                 dbStatus = 'completed_loss'; // Bot wins ties
-            } else if (liveSession.game_type === 'basketball' && gameState.playerScore === gameState.botScore) {
+            } else if (liveSession.game_type === 'basketball' && playerScore === botScore) {
                 dbStatus = 'completed_push'; // Push on tie
-            } else if (gameState.playerScore > gameState.botScore) {
+            } else if (playerScore > botScore) {
                 dbStatus = 'completed_win';
             } else {
                 dbStatus = 'completed_loss';
@@ -385,15 +384,14 @@ async function finalizeGame(session, finalStatus) {
 
         gameState.finalStatus = dbStatus;
         
-        // The helper now only updates the status and game state. 
-        // `final_payout_lamports` is no longer set here. The main bot will calculate it.
+        // NOTE: final_payout_lamports is intentionally not set here. The Main Bot handles all financial calculations.
         await client.query("UPDATE interactive_game_sessions SET status = $1, game_state_json = $2 WHERE session_id = $3", [dbStatus, JSON.stringify(gameState), sessionId]);
         
         // Notify the main bot that the game is complete.
         await client.query(`NOTIFY game_completed, '${JSON.stringify({ session_id: sessionId })}'`);
         await client.query('COMMIT');
         
-        if(gameState.lastMessageId) { // For Darts 501
+        if(gameState.lastMessageId) { // Cleanup for Darts 501
              await bot.deleteMessage(liveSession.chat_id, gameState.lastMessageId).catch(()=>{});
         }
     } catch (e) { 
