@@ -1,4 +1,4 @@
-// helper_bot.js - FINAL UNIFIED VERSION v29 - UI Polish & Final Adjustments
+// helper_bot.js - FINAL UNIFIED VERSION v31 - sendDice Implementation
 
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
@@ -13,13 +13,10 @@ const DATABASE_URL = process.env.DATABASE_URL;
 const MY_BOT_ID = process.env.HELPER_BOT_ID || 'HelperBot_1';
 const GAME_LOOP_INTERVAL = 3000;
 const PLAYER_ACTION_TIMEOUT = 45000;
-const INTER_EMOJI_DELAY = 750; // Delay between sending multiple emojis
-const FINAL_REVEAL_DELAY = 1500; // Delay after last emoji before showing result
 
 // --- Basic Utilities ---
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const PQueue = cjsPQueue.default ?? cjsPQueue;
-const rollDice = () => Math.floor(Math.random() * 6) + 1;
 
 // --- Price Fetching & Formatting Dependencies ---
 const SOL_DECIMALS = 9;
@@ -74,6 +71,7 @@ bot.on('polling_error', (error) => console.error(`[Helper] Polling Error: ${erro
 // API Failsafe Queue: Process max 1 message every 3.5 seconds to stay under the 20 msg/min/group limit.
 const telegramSendQueue = new PQueue({ concurrency: 1, interval: 3500, intervalCap: 1 });
 const queuedSendMessage = (...args) => telegramSendQueue.add(() => bot.sendMessage(...args).catch(console.error));
+const queuedSendDice = (chat_id, emoji) => telegramSendQueue.add(() => bot.sendDice({ chat_id, emoji }).catch(console.error));
 
 
 // --- Round-Based Hoops (PvB Basketball) Game Logic ---
@@ -97,7 +95,7 @@ async function updateRoundBasedHoopsMessage(session, lastRoundInfo = null) {
     
     let titleHTML = `🏀 <b>Round-Based Hoops</b> | ${escape(gameState.p1Name)}\n`;
     let bodyHTML = `Wager: <b>${escape(betDisplayUSD)}</b>\n\n`;
-    if (lastRoundInfo) { bodyHTML += `<i>Last Round's Shots: ${lastRoundInfo.rolls.join(', ')} (Multiplier x${lastRoundInfo.multiplier.toFixed(2)})</i>\n`; }
+    if (lastRoundInfo) { bodyHTML += `<i>Last Round's Rolls: ${lastRoundInfo.rolls.join(', ')} (Multiplier x${lastRoundInfo.multiplier.toFixed(2)})</i>\n`; }
     bodyHTML += `<b>Round: ${gameState.currentRound}/${ROUND_BASED_HOOPS_ROUNDS}</b> | Multiplier: <b>x${gameState.currentMultiplier.toFixed(2)}</b>\n`;
     bodyHTML += `Current Payout: <b>${escape(currentPayoutDisplay)}</b>\n\n`;
     
@@ -109,7 +107,7 @@ async function updateRoundBasedHoopsMessage(session, lastRoundInfo = null) {
 
     if (gameState.currentRound === 1 && !lastRoundInfo) {
         promptHTML = `<i>Your first round. Let's play!</i>`;
-        keyboardRows.shift(); // Remove cashout button on first turn
+        keyboardRows[0].shift();
     }
 
     const fullMessage = `${titleHTML}${bodyHTML}${promptHTML}`;
@@ -120,25 +118,22 @@ async function updateRoundBasedHoopsMessage(session, lastRoundInfo = null) {
     }
 }
 async function handleRoundBasedHoopsContinue(session) {
-    const { chat_id } = session;
-    const emoji = getGameEmoji('basketball');
-    let sentMessages = [];
-    for(let i=0; i<ROUND_BASED_HOOPS_SHOTS_PER_ROUND; i++) {
-        const msg = await queuedSendMessage(chat_id, emoji);
-        if(msg) sentMessages.push(msg.message_id);
-        await sleep(INTER_EMOJI_DELAY);
+    await bot.deleteMessage(session.chat_id, session.game_state_json.lastMessageId).catch(() => {});
+    
+    let rolls = [];
+    for (let i = 0; i < ROUND_BASED_HOOPS_SHOTS_PER_ROUND; i++) {
+        const diceMessage = await queuedSendDice(session.chat_id, '🏀');
+        if (diceMessage) rolls.push(diceMessage.dice.value);
     }
-    await sleep(FINAL_REVEAL_DELAY);
-    sentMessages.forEach(id => bot.deleteMessage(chat_id, id).catch(() => {}));
-
+    
     const gameState = session.game_state_json;
-    const rolls = [rollDice(), rollDice()];
     let roundMultiplier = 1.0;
     for (const roll of rolls) {
         const effect = ROUND_BASED_HOOPS_EFFECTS[roll];
         if (effect.multiplier_effect === 0.0) { await finalizeGame(session, 'completed_loss'); return; }
         roundMultiplier *= effect.multiplier_effect;
     }
+
     gameState.currentMultiplier *= roundMultiplier;
     gameState.currentRound++;
     if (gameState.currentRound > ROUND_BASED_HOOPS_ROUNDS) { await finalizeGame(session, 'completed_cashout'); }
@@ -168,7 +163,7 @@ async function updateKingpinsChallengeMessage(session, lastFrameResult = null) {
     const currentPayoutDisplay = await formatBalanceForDisplay(currentPayout, 'USD');
     let titleHTML = `🎳 <b>Kingpin's Challenge</b> | ${escape(gameState.p1Name)}\n`;
     let bodyHTML = `Wager: <b>${escape(betDisplayUSD)}</b>\n\n`;
-    if (lastFrameResult) { bodyHTML += `<i>Frame ${gameState.currentFrame - 1} Result: <b>${escape(lastFrameResult.result)}</b> (Shots: ${lastFrameResult.rolls.join(', ')})</i>\n`; }
+    if (lastFrameResult) { bodyHTML += `<i>Frame ${gameState.currentFrame - 1} Result: <b>${escape(lastFrameResult.result)}</b> (Rolls: ${lastFrameResult.rolls.join(', ')})</i>\n`; }
     bodyHTML += `Total Multiplier: <b>x${gameState.currentMultiplier.toFixed(2)}</b> | Payout: <b>${escape(currentPayoutDisplay)}</b>\n\n`;
     
     let promptHTML = `<i>Frame ${gameState.currentFrame}/${NEW_BOWLING_FRAMES}. Ready to bowl?</i>`;
@@ -189,47 +184,40 @@ async function updateKingpinsChallengeMessage(session, lastFrameResult = null) {
     }
 }
 async function handleKingpinsChallengeContinue(session) {
-    const { chat_id, game_state_json: gameState } = session;
-    const emoji = getGameEmoji('bowling');
-    let sentMessages = [];
-
-    const msg1 = await queuedSendMessage(chat_id, emoji);
-    if(msg1) sentMessages.push(msg1.message_id);
-    await sleep(INTER_EMOJI_DELAY);
+    await bot.deleteMessage(session.chat_id, session.game_state_json.lastMessageId).catch(() => {});
 
     let frameResult = {};
-    const roll1 = rollDice();
-    if (roll1 === 1) { sentMessages.forEach(id => bot.deleteMessage(chat_id, id).catch(() => {})); await finalizeGame(session, 'completed_loss'); return; }
+    const diceMessage1 = await queuedSendDice(session.chat_id, '🎳');
+    if (!diceMessage1) { await finalizeGame(session, 'error'); return; }
+    const roll1 = diceMessage1.dice.value;
+
+    if (roll1 === 1) { await finalizeGame(session, 'completed_loss'); return; }
     
     if (roll1 === 6) {
-        gameState.currentMultiplier *= NEW_BOWLING_MULTIPLIERS.STRIKE;
+        session.game_state_json.currentMultiplier *= NEW_BOWLING_MULTIPLIERS.STRIKE;
         frameResult = { result: 'Strike 💎', rolls: [6] };
     } else {
-        const msg2 = await queuedSendMessage(chat_id, emoji);
-        if(msg2) sentMessages.push(msg2.message_id);
-        await sleep(INTER_EMOJI_DELAY);
+        const diceMessage2 = await queuedSendDice(session.chat_id, '🎳');
+        if (!diceMessage2) { await finalizeGame(session, 'error'); return; }
+        const roll2 = diceMessage2.dice.value;
 
-        const roll2 = rollDice();
-        if (roll2 === 1) { sentMessages.forEach(id => bot.deleteMessage(chat_id, id).catch(() => {})); await finalizeGame(session, 'completed_loss'); return; }
+        if (roll2 === 1) { await finalizeGame(session, 'completed_loss'); return; }
         
         const pinsFromFirstShot = NEW_BOWLING_PINS_PER_ROLL[roll1] || 0;
         const pinsFromSecondShot = NEW_BOWLING_PINS_PER_ROLL[roll2] || 0;
         if ((pinsFromFirstShot + pinsFromSecondShot) >= 10) {
-            gameState.currentMultiplier *= NEW_BOWLING_MULTIPLIERS.SPARE;
+            session.game_state_json.currentMultiplier *= NEW_BOWLING_MULTIPLIERS.SPARE;
             frameResult = { result: 'Spare ⭐', rolls: [roll1, roll2] };
         } else {
-            gameState.currentMultiplier *= NEW_BOWLING_MULTIPLIERS.OPEN;
+            session.game_state_json.currentMultiplier *= NEW_BOWLING_MULTIPLIERS.OPEN;
             frameResult = { result: 'Open Frame', rolls: [roll1, roll2] };
         }
     }
     
-    await sleep(FINAL_REVEAL_DELAY);
-    sentMessages.forEach(id => bot.deleteMessage(chat_id, id).catch(() => {}));
-
-    gameState.currentFrame++;
-    if (gameState.currentFrame > NEW_BOWLING_FRAMES) { await finalizeGame(session, 'completed_cashout'); }
+    session.game_state_json.currentFrame++;
+    if (session.game_state_json.currentFrame > NEW_BOWLING_FRAMES) { await finalizeGame(session, 'completed_cashout'); }
     else {
-        await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
+        await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(session.game_state_json), session.session_id]);
         await updateKingpinsChallengeMessage(session, frameResult);
     }
 }
@@ -277,20 +265,17 @@ async function updateBullseyeBlitzMessage(session, lastRoundResult = null) {
     }
 }
 async function handleBullseyeBlitzContinue(session) {
-    const { chat_id, game_state_json: gameState } = session;
-    const emoji = getGameEmoji('darts');
-    let sentMessages = [];
-    for(let i=0; i<BLITZ_DARTS_THROWS_PER_ROUND; i++) {
-        const msg = await queuedSendMessage(chat_id, emoji);
-        if(msg) sentMessages.push(msg.message_id);
-        await sleep(INTER_EMOJI_DELAY);
-    }
-    await sleep(FINAL_REVEAL_DELAY);
-    sentMessages.forEach(id => bot.deleteMessage(chat_id, id).catch(() => {}));
+    await bot.deleteMessage(session.chat_id, session.game_state_json.lastMessageId).catch(() => {});
 
-    const rolls = [rollDice(), rollDice()];
+    let rolls = [];
+    for(let i=0; i<BLITZ_DARTS_THROWS_PER_ROUND; i++) {
+        const diceMessage = await queuedSendDice(session.chat_id, '🎯');
+        if (diceMessage) rolls.push(diceMessage.dice.value);
+    }
+    
     if (rolls.every(r => r <= BLITZ_DARTS_BUST_ROLL_MAX)) { await finalizeGame(session, 'completed_loss'); return; }
     
+    const gameState = session.game_state_json;
     const scoreThisRound = rolls.reduce((sum, roll) => sum + (BLITZ_DARTS_POINTS_PER_ROLL[roll] || 0), 0);
     gameState.totalScore += scoreThisRound;
     gameState.currentMultiplier = BLITZ_DARTS_MULTIPLIERS[gameState.currentRound - 1];
@@ -358,18 +343,15 @@ async function updateDarts501Message(session, lastVisitResult = null) {
     }
 }
 async function handleDarts501Continue(session) {
-    const { chat_id, game_state_json: gameState } = session;
-    const emoji = getGameEmoji('darts_501');
-    let sentMessages = [];
-    for(let i=0; i<DARTS_501_THROWS_PER_VISIT; i++) {
-        const msg = await queuedSendMessage(chat_id, emoji);
-        if(msg) sentMessages.push(msg.message_id);
-        await sleep(INTER_EMOJI_DELAY);
-    }
-    await sleep(FINAL_REVEAL_DELAY);
-    sentMessages.forEach(id => bot.deleteMessage(chat_id, id).catch(() => {}));
+    await bot.deleteMessage(session.chat_id, session.game_state_json.lastMessageId).catch(() => {});
     
-    const rolls = [rollDice(), rollDice()];
+    let rolls = [];
+    for(let i=0; i<DARTS_501_THROWS_PER_VISIT; i++) {
+        const diceMessage = await queuedSendDice(session.chat_id, '🎯');
+        if (diceMessage) rolls.push(diceMessage.dice.value);
+    }
+
+    const gameState = session.game_state_json;
     const scoreThisVisit = rolls.reduce((sum, roll) => sum + (BLITZ_DARTS_POINTS_PER_ROLL[roll] || 0), 0);
     let lastVisitResult = { rolls, score: scoreThisVisit, isBust: false };
     const scoreAfterThrow = gameState.remainingScore - scoreThisVisit;
