@@ -63,8 +63,8 @@ const bot = new TelegramBot(HELPER_BOT_TOKEN, { polling: { params: { allowed_upd
 bot.on('polling_error', (error) => console.error(`[Helper] Polling Error: ${error.code} - ${error.message}`));
 // API Failsafe Queue: Ensures messages are sent sequentially and spaced out.
 const telegramSendQueue = new PQueue({ concurrency: 1, interval: 1500, intervalCap: 1 });
-const queuedSendMessage = (...args) => telegramSendQueue.add(() => bot.sendMessage(...args).catch(console.error));
-const queuedSendDice = (chat_id, emoji) => telegramSendQueue.add(() => bot.sendDice({ chat_id, emoji }).catch(console.error));
+const queuedSendMessage = (...args) => telegramSendQueue.add(() => bot.sendMessage(...args));
+const queuedSendDice = (chat_id, emoji) => telegramSendQueue.add(() => bot.sendDice(chat_id, { emoji }));
 
 
 // --- Performance-Based Darts 501 Challenge (Solo PvB) Game Logic ---
@@ -194,57 +194,60 @@ async function handlePvBRoll(session, playerRollValue) {
     const { chat_id, game_type, game_state_json: gameState } = session;
     const emoji = getGameEmoji(game_type);
 
-    // 1. Bot takes its turn VISIBLY
-    const botDiceMessage = await queuedSendDice(chat_id, emoji);
-    if (!botDiceMessage || !botDiceMessage.dice) { await finalizeGame(session, 'error'); return; }
-    const botRollValue = botDiceMessage.dice.value;
-    
-    // Brief pause for dramatic effect, letting animations play
-    await sleep(2500);
+    try {
+        // 1. Bot takes its turn VISIBLY
+        const botDiceMessage = await queuedSendDice(chat_id, emoji);
+        if (!botDiceMessage || !botDiceMessage.dice) {
+            throw new Error("Failed to send bot's dice roll message.");
+        }
+        const botRollValue = botDiceMessage.dice.value;
+        await sleep(2500);
 
-    // 2. Calculate points for this round
-    let playerResult = { value: playerRollValue, points: 0 };
-    let botResult = { value: botRollValue, points: 0 };
+        // 2. Calculate points for this round
+        let playerResult = { value: playerRollValue, points: 0 };
+        let botResult = { value: botRollValue, points: 0 };
 
-    if (game_type === 'bowling') {
-        playerResult.points = PVB_BOWLING_SCORES[playerRollValue] || 0;
-        botResult.points = PVB_BOWLING_SCORES[botRollValue] || 0;
-    } else if (game_type === 'basketball') {
-        // Player makes on 4, 5, 6 (50% chance)
-        playerResult.points = (playerRollValue >= 4) ? 1 : 0;
-        // Bot makes on 3, 4, 5, 6 (66.7% chance) - HOUSE EDGE
-        botResult.points = (botRollValue >= 3) ? 1 : 0;
-    } else if (game_type === 'darts') {
-        playerResult.points = DARTS_501_POINTS_PER_ROLL[playerRollValue] || 0;
-        botResult.points = DARTS_501_POINTS_PER_ROLL[botRollValue] || 0;
-    }
-    
-    // 3. Update Game State
-    gameState.playerRolls.push(playerRollValue);
-    gameState.botRolls.push(botRollValue);
-    gameState.playerScore += playerResult.points;
-    gameState.botScore += botResult.points;
+        if (game_type === 'bowling') {
+            playerResult.points = PVB_BOWLING_SCORES[playerRollValue] || 0;
+            botResult.points = PVB_BOWLING_SCORES[botRollValue] || 0;
+        } else if (game_type === 'basketball') {
+            playerResult.points = (playerRollValue >= 4) ? 1 : 0;
+            botResult.points = (botRollValue >= 3) ? 1 : 0;
+        } else if (game_type === 'darts') {
+            playerResult.points = DARTS_501_POINTS_PER_ROLL[playerRollValue] || 0;
+            botResult.points = DARTS_501_POINTS_PER_ROLL[botRollValue] || 0;
+        }
+        
+        // 3. Update Game State
+        gameState.playerRolls.push(playerRollValue);
+        gameState.botRolls.push(botRollValue);
+        gameState.playerScore += playerResult.points;
+        gameState.botScore += botResult.points;
 
-    // 4. Check Game End Condition
-    const totalTurns = getPvBTotalTurns(game_type);
-    const isGameOver = (gameState.currentTurn >= totalTurns);
-    
-    // 5. Create and send the summary message
-    let summaryMessage = `You rolled a <b>${playerResult.value}</b>, scoring <b>${playerResult.points}</b> pts.\n`;
-    summaryMessage += `The Bot rolled a <b>${botResult.value}</b>, scoring <b>${botResult.points}</b> pts.\n\n`;
-    summaryMessage += `<b>Total Score:</b> ${escape(gameState.p1Name)} <b>${gameState.playerScore}</b> - <b>${gameState.botScore}</b> Bot`;
+        const totalTurns = getPvBTotalTurns(game_type);
+        const isGameOver = (gameState.currentTurn >= totalTurns);
+        
+        // 4. Create and send the summary message
+        let summaryMessage = `You rolled a <b>${playerResult.value}</b>, scoring <b>${playerResult.points}</b> pts.\n`;
+        summaryMessage += `The Bot rolled a <b>${botResult.value}</b>, scoring <b>${botResult.points}</b> pts.\n\n`;
+        summaryMessage += `<b>Total Score:</b> ${escape(gameState.p1Name)} <b>${gameState.playerScore}</b> - <b>${gameState.botScore}</b> Bot`;
 
-    await queuedSendMessage(chat_id, summaryMessage, { parse_mode: 'HTML' });
-    await sleep(2000);
+        await queuedSendMessage(chat_id, summaryMessage, { parse_mode: 'HTML' });
+        await sleep(2000);
 
-    // 6. Proceed to next step
-    if (isGameOver) {
-        await finalizeGame(session, 'pvb_resolve');
-    } else {
-        gameState.currentTurn++;
-        // Save state and prompt for the next turn
-        await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
-        await promptPvBAction(session);
+        // 5. Proceed to next step
+        if (isGameOver) {
+            await finalizeGame(session, 'pvb_resolve');
+        } else {
+            gameState.currentTurn++;
+            await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
+            await promptPvBAction(session);
+        }
+    } catch (error) {
+        // If any of the `await` calls fail (like sending a message), this block will catch it.
+        console.error(`[handlePvBRoll] Error during bot's turn: ${error.message}. Finalizing game with error state.`);
+        // Finalize the game with an error, which will trigger a refund on the main bot.
+        await finalizeGame(session, 'error');
     }
 }
 
