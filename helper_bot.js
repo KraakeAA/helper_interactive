@@ -1,4 +1,4 @@
-// helper_bot.js - FINAL UNIFIED VERSION v13 - Round-Based Basketball Implemented, No Omissions
+// helper_bot.js - FINAL UNIFIED VERSION v14 - Round-Based Basketball (No Continue Button), No Omissions
 
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
@@ -157,9 +157,8 @@ async function updateRoundBasedHoopsMessage(sessionId) {
             const shotsRemaining = ROUND_BASED_HOOPS_SHOTS_PER_ROUND - gameState.shotsTakenInRound;
             promptHTML = `Please send <b>${shotsRemaining}</b> 🏀 emoji(s) to take your shot(s) for this round.`;
         } else if (gameState.status === 'awaiting_cashout_decision') {
-            promptHTML = `Round ${gameState.currentRound} complete! Continue to the next round or cash out now.`;
+            promptHTML = `Round ${gameState.currentRound} complete! Send 🏀 to start the next round, or cash out now.`;
             keyboardRows.push([
-                { text: `▶️ Continue to Round ${gameState.currentRound + 1}`, callback_data: `roundbased_hoops_continue:${sessionId}` },
                 { text: `💰 Cash Out (${escape(currentPayoutDisplay)})`, callback_data: `interactive_cashout:${sessionId}` }
             ]);
         }
@@ -188,6 +187,13 @@ async function updateRoundBasedHoopsMessage(sessionId) {
 async function handleRoundBasedHoopsRoll(session, rollValue) {
     const logPrefix = `[HandleRoundBasedHoopsRoll SID:${session.session_id}]`;
     const gameState = session.game_state_json;
+
+    // If player sends a roll when they should be cashing out/continuing, treat it as continuing.
+    if (gameState.status === 'awaiting_cashout_decision') {
+        gameState.currentRound++;
+        gameState.shotsTakenInRound = 0;
+        gameState.status = 'awaiting_shots';
+    }
 
     if (gameState.status !== 'awaiting_shots') return;
 
@@ -220,35 +226,11 @@ async function handleRoundBasedHoopsRoll(session, rollValue) {
             await updateRoundBasedHoopsMessage(session.session_id);
         }
     } else {
-        // Round is not over, silently wait for the next roll
+        // Round is not over, silently wait for the next roll and save state
         await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
     }
 }
 
-async function handleRoundBasedHoopsContinue(sessionId) {
-    const logPrefix = `[HandleHoopsContinue SID:${sessionId}]`;
-    let client = null;
-    try {
-        client = await pool.connect();
-        const res = await client.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [sessionId]);
-        if (res.rowCount === 0 || res.rows[0].game_state_json.status !== 'awaiting_cashout_decision') return;
-
-        const session = res.rows[0];
-        const gameState = session.game_state_json;
-
-        gameState.currentRound++;
-        gameState.shotsTakenInRound = 0;
-        gameState.status = 'awaiting_shots';
-
-        await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), sessionId]);
-        await updateRoundBasedHoopsMessage(sessionId);
-
-    } catch (e) {
-        console.error(`${logPrefix} Error: ${e.message}`);
-    } finally {
-        if (client) client.release();
-    }
-}
 
 // --- End of NEW Round-Based Hoops Logic ---
 
@@ -282,7 +264,7 @@ async function handleGameStart(session) {
         const isNewPvPDuel = gameType.includes('_pvp');
         
         if (gameType === 'basketball') {
-            // Initialization is handled within runRoundBasedHoops
+            // Initialization is now handled within runRoundBasedHoops
         } else if (isPressYourLuck) {
             gameState.turn = 1;
             gameState.rolls = [];
@@ -522,8 +504,8 @@ async function finalizeGame(session, finalStatus) {
         let finalPayout = 0n;
 
         if (liveSession.game_type === 'basketball') {
-            if (finalStatus === 'completed_win' || finalStatus === 'completed_cashout') {
-                dbStatus = finalStatus; 
+            if (finalStatus === 'completed_cashout') {
+                dbStatus = 'completed_cashout';
                 const multiplier = gameState.currentMultiplier || 0;
                 finalPayout = (BigInt(liveSession.bet_amount_lamports) * BigInt(Math.floor(multiplier * 100))) / 100n;
             } else { // bust, timeout, error
@@ -576,9 +558,12 @@ bot.on('callback_query', async (callbackQuery) => {
     if (!data) return;
 
     if (data.startsWith('roundbased_hoops_continue:')) {
-        await bot.answerCallbackQuery(callbackQuery.id).catch(() => {});
+        await bot.answerCallbackQuery(callbackQuery.id, { text: "Starting next round..." }).catch(() => {});
         const sessionId = data.split(':')[1];
-        await handleRoundBasedHoopsContinue(sessionId);
+        const res = await pool.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [sessionId]);
+        if (res.rowCount > 0) {
+            await handleRoundBasedHoopsRoll(res.rows[0], 0); // Pass a neutral roll value just to trigger the round change
+        }
         return;
     }
 
