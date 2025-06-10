@@ -46,21 +46,22 @@ const BULLSEYE_BLITZ_EFFECTS = {
     2: { outcome: 'Outer Ring 🟡', multiplier_increase: 0.5 },
     1: { outcome: 'MISS! 💥', multiplier_increase: 0.0 }
 };
-const BASKETBALL_SHOTS_TOTAL = 5;
-const DOWNTOWN_SHOOTOUT_EFFECTS = {
-    6: { outcome: 'Swish! 🎯', multiplier_increase: 1.9 },
-    5: { outcome: 'Swish! 🎯', multiplier_increase: 1.5 },
-    4: { outcome: 'Rim In! 👍', multiplier_increase: 1.1 },
-    3: { outcome: 'Rim Out 🟡', multiplier_increase: 0.7 },
-    2: { outcome: 'Airball! 💥', multiplier_increase: 0.0 },
-    1: { outcome: 'Airball! 💥', multiplier_increase: 0.0 }
-};
 const PVP_BOWLING_FRAMES = 3;
 const PVP_BASKETBALL_SHOTS = 5;
 const PVP_DARTS_THROWS = 3;
 const THREE_POINT_PAYOUTS = [1.5, 2.2, 3.5, 5.0, 10.0, 20.0, 50.0];
 const PINPOINT_BOWLING_PAYOUT_MULTIPLIER = 5.5;
 const DARTS_FORTUNE_PAYOUTS = { 6: 3.5, 5: 1.5, 4: 0.5, 3: 0.2, 2: 0.1, 1: 0.0 };
+
+// --- NEW: Hot Streak Hoops (PvB Basketball) Game Constants ---
+const HOT_STREAK_HOOPS_EFFECTS = {
+    6: { outcome: 'Swish! 🎯', multiplier_increase: 1.8 },
+    5: { outcome: 'Nice Shot! 👍', multiplier_increase: 1.3 },
+    4: { outcome: 'Rim In! ⚪️', multiplier_increase: 1.0 }, // Neutral
+    3: { outcome: 'Rim Out! 🟡', multiplier_increase: 0.5 }, // Penalty
+    2: { outcome: 'Airball! 💥', multiplier_increase: 0.0 },  // Bust
+    1: { outcome: 'Airball! 💥', multiplier_increase: 0.0 }   // Bust
+};
 
 
 // --- Database & Bot Setup ---
@@ -74,44 +75,29 @@ bot.on('polling_error', (error) => console.error(`[Helper] Polling Error: ${erro
 const telegramSendQueue = new PQueue({ concurrency: 1, interval: 1000 / 20, intervalCap: 1 });
 const queuedSendMessage = (...args) => telegramSendQueue.add(() => bot.sendMessage(...args));
 
-// --- Start of REVISED "Simple Hoops" Game Logic (Streamlined Flow) ---
-
-// --- Simple Hoops Game Constants ---
-const SIMPLE_HOOPS_ROUNDS = 5;
-const SIMPLE_HOOPS_SHOTS_PER_ROUND = 2;
-const SIMPLE_HOOPS_INSTANT_LOSS_ROLLS = [1, 2];
-const SIMPLE_HOOPS_SUCCESS_ROLLS = [5, 6];
-const SIMPLE_HOOPS_CASHOUT_MULTIPLIER = 0.5; // Player gets 50% of their bet back
-const SIMPLE_HOOPS_PAYOUTS = {
-    // Payout multipliers for WINNING and MOVING PAST a round (does NOT include original stake)
-    1: 0.2, // Cleared Round 1
-    2: 0.5, // Cleared Round 2
-    3: 1.0, // Cleared Round 3
-    4: 2.0, // Cleared Round 4
-    5: 4.0  // Cleared Round 5 (Grand Prize, total 5x return)
-};
+// --- NEW: Hot Streak Hoops (PvB Basketball) Game Logic ---
 
 /**
- * Entry point and state initializer for the Simple Hoops game.
+ * Entry point and state initializer for the Hot Streak Hoops game.
  * @param {object} session The game session data from the database.
  */
-async function runSimpleHoopsGame(session) {
-    const logPrefix = `[RunSimpleHoops_V3 SID:${session.session_id}]`;
-    console.log(`${logPrefix} Starting Simple Hoops logic.`);
+async function runHotStreakHoops(session) {
+    const logPrefix = `[RunHotStreak SID:${session.session_id}]`;
+    console.log(`${logPrefix} Starting Hot Streak Hoops logic.`);
     let client = null;
     try {
         client = await pool.connect();
         const gameState = session.game_state_json || {};
         
-        // Initialize game state robustly
-        gameState.currentRound = 1;
-        gameState.shotsTakenInRound = 0;
-        gameState.currentRoundRolls = []; // CRITICAL: Ensure this is always initialized
-        gameState.status = 'awaiting_shots';
+        // Initialize game state for a new game
+        gameState.turn = 1;
+        gameState.rolls = [];
+        gameState.currentMultiplier = 1.0;
+        gameState.status = 'awaiting_roll';
 
         await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
         
-        await updateSimpleHoopsMessageHelper(session.session_id);
+        await updateHotStreakHoopsMessage(session.session_id);
 
     } catch (e) {
         console.error(`${logPrefix} Error starting game: ${e.message}`);
@@ -122,11 +108,11 @@ async function runSimpleHoopsGame(session) {
 }
 
 /**
- * Creates and updates the single game message for the new Simple Hoops flow.
+ * Creates and updates the game message for Hot Streak Hoops.
  * @param {number} sessionId The database ID of the session.
  */
-async function updateSimpleHoopsMessageHelper(sessionId) {
-    const logPrefix = `[UpdateSimpleHoopsMsg_V3 SID:${sessionId}]`;
+async function updateHotStreakHoopsMessage(sessionId) {
+    const logPrefix = `[UpdateHotStreakMsg SID:${sessionId}]`;
     let client = null;
     try {
         client = await pool.connect();
@@ -146,34 +132,37 @@ async function updateSimpleHoopsMessageHelper(sessionId) {
         }
 
         const betDisplayUSD = await formatBalanceForDisplay(session.bet_amount_lamports, 'USD');
-        let titleHTML = `🏀 <b>Simple Hoops Challenge!</b> 🏀`;
-        let bodyHTML = `Player: <b>${escape(gameState.p1Name)}</b> | Wager: <b>${betDisplayUSD}</b>\n\n`;
-        let promptHTML = "";
+        const gameName = "Hot Streak Hoops";
+        const currentPayout = (BigInt(session.bet_amount_lamports) * BigInt(Math.floor(gameState.currentMultiplier * 100))) / 100n;
+        const currentPayoutDisplay = await formatBalanceForDisplay(currentPayout, 'USD');
+
+        let titleHTML = `🏀 <b>${escape(gameName)}</b> 🏀\n\n`;
+        let bodyHTML = `Player: <b>${escape(gameState.p1Name)}</b> | Wager: <b>${escape(betDisplayUSD)}</b>\n\n`;
+        
+        let rollsDisplay = gameState.rolls.length > 0 ? gameState.rolls.map(r => `<b>${r}</b>`).join(' → ') : '...';
+        bodyHTML += `Rolls: ${rollsDisplay}\n`;
+        bodyHTML += `Multiplier: <b>x${gameState.currentMultiplier.toFixed(2)}</b>\n`;
+        bodyHTML += `Current Payout: <b>${escape(currentPayoutDisplay)}</b>\n\n`;
+
         const keyboardRows = [];
-
-        let progressIcons = "";
-        for (let i = 1; i <= SIMPLE_HOOPS_ROUNDS; i++) {
-            progressIcons += (i < gameState.currentRound) ? "✅ " : (i === gameState.currentRound ? "🎯 " : "⚪️ ");
-        }
-        bodyHTML += `Progress: ${progressIcons}\nRound: <b>${gameState.currentRound} / ${SIMPLE_HOOPS_ROUNDS}</b>\n\n`;
-
-        if (gameState.status === 'awaiting_shots') {
-            const shotsRemaining = SIMPLE_HOOPS_SHOTS_PER_ROUND - (gameState.currentRoundRolls?.length || 0);
-            promptHTML = `Please send <b>${shotsRemaining}</b> more 🏀 emoji(s) to take your shot(s) for this round.`;
-        } else if (gameState.status === 'round_failed_cashout_prompt') {
-            const cashoutValue = BigInt(session.bet_amount_lamports) * BigInt(Math.floor(SIMPLE_HOOPS_CASHOUT_MULTIPLIER * 100)) / 100n;
-            const cashoutDisplay = await formatBalanceForDisplay(cashoutValue, 'USD');
-            promptHTML = `You missed both shots! Either <b>Cash Out</b> now or send two 🏀 emojis to risk it and continue to the next round.`;
-            keyboardRows.push([ { text: `💰 Cash Out (~${cashoutDisplay})`, callback_data: `simple_hoops_cashout:${sessionId}` } ]);
+        let promptHTML = `It's your turn! Send a 🏀 to take your shot!`;
+        
+        // Only show cashout/next shot if they have made at least one successful roll
+        if(gameState.rolls.length > 0) {
+            promptHTML = `What's your next move?`;
+            keyboardRows.push([
+                { text: `🏀 Next Shot`, callback_data: `interactive_roll_request:${sessionId}` },
+                { text: `💰 Cash Out (${escape(currentPayoutDisplay)})`, callback_data: `interactive_cashout:${sessionId}` }
+            ]);
         }
 
-        const fullMessage = `${titleHTML}${bodyHTML}${promptHTML}`;
+        const fullMessage = `${titleHTML}${bodyHTML}<i>${promptHTML}</i>`;
         const sentMsg = await queuedSendMessage(session.chat_id, fullMessage, { parse_mode: 'HTML', reply_markup: { inline_keyboard: keyboardRows } });
         
         if (sentMsg) {
             gameState.lastMessageId = sentMsg.message_id;
-            await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), sessionId]);
-            const timeoutId = setTimeout(() => finalizeGame({ session_id: sessionId }, 'completed_timeout'), PLAYER_ACTION_TIMEOUT * 2.5);
+            await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), sessionId]);
+            const timeoutId = setTimeout(() => handleGameTimeout(sessionId), PLAYER_ACTION_TIMEOUT);
             activeTurnTimeouts.set(sessionId, timeoutId);
         }
     } catch (e) {
@@ -184,85 +173,42 @@ async function updateSimpleHoopsMessageHelper(sessionId) {
 }
 
 /**
- * Handles the logic for a player's roll in Simple Hoops.
+ * Handles a player's roll in Hot Streak Hoops.
  * @param {object} session The game session data.
  * @param {number} rollValue The value of the dice roll.
  */
-async function handleSimpleHoopsRollHelper(session, rollValue) {
-    const logPrefix = `[HandleSimpleHoopsRoll_V4 SID:${session.session_id}]`;
+async function handleHotStreakHoopsRoll(session, rollValue) {
+    const logPrefix = `[HandleHotStreakRoll SID:${session.session_id}]`;
     const gameState = session.game_state_json;
 
-    // This handles the case where the user sends a roll to continue instead of cashing out
-    if (gameState.status === 'round_failed_cashout_prompt') {
-        if (gameState.currentRound >= SIMPLE_HOOPS_ROUNDS) {
-            await finalizeGame(session, 'loss_final_round');
-            return;
-        }
-        gameState.currentRound++;
-        gameState.currentRoundRolls = [];
-        gameState.shotsTakenInRound = 0;
-        gameState.status = 'awaiting_shots';
-    }
+    if (gameState.status !== 'awaiting_roll') return;
 
-    if (gameState.status !== 'awaiting_shots') return;
-
-    // Safety check that caused the previous error
-    if (!Array.isArray(gameState.currentRoundRolls)) {
-        console.warn(`${logPrefix} gameState.currentRoundRolls was not an array. Re-initializing.`);
-        gameState.currentRoundRolls = [];
-    }
-    
-    // 1. Check for instant loss
-    if (SIMPLE_HOOPS_INSTANT_LOSS_ROLLS.includes(rollValue)) {
-        await finalizeGame(session, 'bust');
+    const effect = HOT_STREAK_HOOPS_EFFECTS[rollValue];
+    if (!effect) {
+        console.error(`${logPrefix} Invalid roll value: ${rollValue}`);
         return;
     }
 
-    // 2. Add roll to the current round's shots
-    gameState.currentRoundRolls.push(rollValue);
-
-    // 3. Check if the round is complete (2 shots taken)
-    if (gameState.currentRoundRolls.length >= SIMPLE_HOOPS_SHOTS_PER_ROUND) {
-        const roundSuccess = gameState.currentRoundRolls.some(roll => SIMPLE_HOOPS_SUCCESS_ROLLS.includes(roll));
-
-        if (roundSuccess) {
-            if (gameState.currentRound >= SIMPLE_HOOPS_ROUNDS) {
-                await finalizeGame(session, 'completed_win');
-            } else {
-                gameState.currentRound++;
-                gameState.currentRoundRolls = [];
-                await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
-                await updateSimpleHoopsMessageHelper(session.session_id);
-            }
-        } else { // Both shots were misses
-            gameState.status = 'round_failed_cashout_prompt';
-            await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
-            await updateSimpleHoopsMessageHelper(session.session_id);
-        }
-    } else {
-        // Silently wait for the next roll
-        await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
+    // Check for bust
+    if (effect.multiplier_increase === 0.0) {
+        await finalizeGame(session, 'completed_loss'); // Bust
+        return;
     }
+
+    // Update state
+    gameState.rolls.push(rollValue);
+    gameState.currentMultiplier = (gameState.currentMultiplier * effect.multiplier_increase);
+    gameState.turn++;
+    
+    await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
+    
+    // Update the message to show new state and offer choices
+    await updateHotStreakHoopsMessage(session.session_id);
 }
 
-/**
- * Handles the "Cash Out" button press.
- * @param {number} sessionId The database ID of the session.
- */
-async function handleSimpleHoopsCashoutHelper(sessionId) {
-    const res = await pool.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [sessionId]);
-    if (res.rowCount > 0 && res.rows[0].game_state_json.status === 'round_failed_cashout_prompt') {
-        await finalizeGame(res.rows[0], 'completed_cashout');
-    }
-}
+// --- End of NEW Hot Streak Hoops Logic ---
 
-// --- End of NEW "Simple Hoops" Game Logic ---
-
-// ===================================================================
 // --- GAME ENGINE & STATE MACHINE ---
-// ===================================================================
-
-// in helper_bot.js - REPLACE the existing handleGameStart function
 
 async function handleGameStart(session) {
     const logPrefix = `[HandleStart_V9_Fix SID:${session.session_id}]`;
@@ -277,23 +223,21 @@ async function handleGameStart(session) {
         );
 
         if (updateRes.rowCount === 0) {
-            await client.query('ROLLBACK');
-            console.log(`${logPrefix} Game already picked up by another process. Aborting.`);
-            return;
-        }
-        
+            await client.query('ROLLBACK');
+            console.log(`${logPrefix} Game already picked up by another process. Aborting.`);
+            return;
+        }
+        
         const liveSession = updateRes.rows[0];
         const gameState = liveSession.game_state_json || {};
         const gameType = liveSession.game_type;
-        
-        // --- CORRECTED LOGIC: Initialize game state for all types FIRST ---
+        
+        // --- Initialize game state for all types FIRST ---
         const isPressYourLuck = ['bowling', 'darts'].includes(gameType) && !gameType.includes('_pvp');
         const isNewPvPDuel = gameType.includes('_pvp');
-        
+        
         if (gameType === 'basketball') {
-            gameState.currentRound = 1;
-            gameState.shotsTakenInRound = 0;
-            gameState.status = 'awaiting_shot';
+            // Initialization is handled within runHotStreakHoops
         } else if (isPressYourLuck) {
             gameState.turn = 1;
             gameState.rolls = [];
@@ -302,27 +246,27 @@ async function handleGameStart(session) {
             gameState.p1Rolls = []; gameState.p1Score = 0;
             gameState.p2Rolls = []; gameState.p2Score = 0;
         }
-        
+        
         gameState.p1Name = gameState.initiatorName || "Player 1";
         gameState.currentPlayerTurn = String(gameState.initiatorId || liveSession.user_id);
         if (gameState.gameMode === 'pvp') gameState.p2Name = gameState.opponentName || "Player 2";
-        
-        // Save the initialized state and COMMIT the transaction
+        
+        // Save the initialized state and COMMIT the transaction
         await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), liveSession.session_id]);
         await client.query('COMMIT');
 
-        // --- NOW, call the appropriate game loop AFTER committing ---
-        if (gameType === 'basketball') {
-            await runSimpleHoopsGame(liveSession);
-        } else if (isPressYourLuck) {
-            await updateKingpinChallengeState(liveSession.session_id);
-        } else if (isNewPvPDuel) {
-            await advancePvPGameState(liveSession.session_id);
-        } else {
-             // Handle legacy or unknown games
-             console.error(`${logPrefix} Unknown game type to start: ${gameType}`); 
-             await finalizeGame(liveSession, 'error');
-        }
+        // --- NOW, call the appropriate game loop AFTER committing ---
+        if (gameType === 'basketball') {
+            await runHotStreakHoops(liveSession);
+        } else if (isPressYourLuck) {
+            await updateKingpinChallengeState(liveSession.session_id);
+        } else if (isNewPvPDuel) {
+            await advancePvPGameState(liveSession.session_id);
+        } else {
+             // Handle legacy or unknown games
+             console.error(`${logPrefix} Unknown game type to start: ${gameType}`); 
+             await finalizeGame(liveSession, 'error');
+        }
     } catch (e) {
         if (client) await client.query('ROLLBACK');
         console.error(`${logPrefix} Error initializing game: ${e.message}`);
@@ -470,48 +414,46 @@ async function promptPvPAction(session, gameState) {
 }
 
 async function handleRollSubmitted(session, lastRoll) {
-    const logPrefix = `[HandleRoll SID:${session.session_id}]`;
-    // This function no longer needs its own DB connection, as the full session is passed in.
-    try {
-        if (session.status !== 'in_progress') {
-            console.warn(`${logPrefix} Roll received but game status is '${session.status}'. Ignoring.`);
-            return;
-        }
+    const logPrefix = `[HandleRoll SID:${session.session_id}]`;
+    try {
+        if (session.status !== 'in_progress') {
+            console.warn(`${logPrefix} Roll received but game status is '${session.status}'. Ignoring.`);
+            return;
+        }
 
-        // --- Routing Logic ---
-        if (session.game_type === 'basketball') {
-            await handleSimpleHoopsRollHelper(session, lastRoll);
-            return; 
-        }
-        
-        const gameState = session.game_state_json || {};
-        const currentPlayerId = gameState.currentPlayerTurn;
+        if (session.game_type === 'basketball') {
+            await handleHotStreakHoopsRoll(session, lastRoll);
+            return; 
+        }
+        
+        const gameState = session.game_state_json || {};
+        const currentPlayerId = gameState.currentPlayerTurn;
 
-        const timeoutId = activeTurnTimeouts.get(session.session_id);
-        if (timeoutId) {
-            clearTimeout(timeoutId);
-            activeTurnTimeouts.delete(session.session_id);
-        }
+        const timeoutId = activeTurnTimeouts.get(session.session_id);
+        if (timeoutId) {
+            clearTimeout(timeoutId);
+            activeTurnTimeouts.delete(session.session_id);
+        }
 
-        if (session.game_type.includes('_pvp')) {
-            const playerKey = (String(gameState.initiatorId) === currentPlayerId) ? 'p1' : 'p2';
-            if (!gameState[`${playerKey}Rolls`]) gameState[`${playerKey}Rolls`] = [];
-            gameState[`${playerKey}Rolls`].push(lastRoll);
-            await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
-            await advancePvPGameState(session.session_id);
-        } else { // For other PvB games like bowling/darts
-            if (!gameState.rolls) gameState.rolls = [];
-            gameState.rolls.push(lastRoll);
-            gameState.lastRollValue = lastRoll;
-            const effect = getPressYourLuckConfig(session.game_type).effects[lastRoll];
-            gameState.currentMultiplier = (gameState.currentMultiplier || 1.0) * effect.multiplier_increase;
-            gameState.turn++;
-            await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
-            await updateKingpinChallengeState(session.session_id);
-        }
-    } catch (e) {
-        console.error(`${logPrefix} Error handling submitted roll: ${e.message}`);
-    }
+        if (session.game_type.includes('_pvp')) {
+            const playerKey = (String(gameState.initiatorId) === currentPlayerId) ? 'p1' : 'p2';
+            if (!gameState[`${playerKey}Rolls`]) gameState[`${playerKey}Rolls`] = [];
+            gameState[`${playerKey}Rolls`].push(lastRoll);
+            await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
+            await advancePvPGameState(session.session_id);
+        } else { // For other PvB games like bowling/darts
+            if (!gameState.rolls) gameState.rolls = [];
+            gameState.rolls.push(lastRoll);
+            gameState.lastRollValue = lastRoll;
+            const effect = getPressYourLuckConfig(session.game_type).effects[lastRoll];
+            gameState.currentMultiplier = (gameState.currentMultiplier || 1.0) * effect.multiplier_increase;
+            gameState.turn++;
+            await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
+            await updateKingpinChallengeState(session.session_id);
+        }
+    } catch (e) {
+        console.error(`${logPrefix} Error handling submitted roll: ${e.message}`);
+    }
 }
 
 async function finalizeGame(session, finalStatus) {
@@ -534,23 +476,22 @@ async function finalizeGame(session, finalStatus) {
         let dbStatus = finalStatus;
         let finalPayout = 0n;
 
-        // --- ADD THIS BLOCK ---
-        if (session.game_type === 'basketball') {
-            if (finalStatus === 'completed_win') {
-                dbStatus = 'completed_win';
-                const multiplier = SIMPLE_HOOPS_PAYOUTS[gameState.currentRound] || 0;
-                const profit = BigInt(liveSession.bet_amount_lamports) * BigInt(Math.floor(multiplier * 100)) / 100n;
-                finalPayout = BigInt(liveSession.bet_amount_lamports) + profit;
-            } else if (finalStatus === 'completed_cashout') {
-                dbStatus = 'completed_cashout';
-                finalPayout = BigInt(liveSession.bet_amount_lamports) * BigInt(Math.floor(SIMPLE_HOOPS_CASHOUT_MULTIPLIER * 100)) / 100n;
-            } else { // bust, timeout, loss_final_round
-                dbStatus = 'completed_loss';
-                finalPayout = 0n;
-            }
-            gameState.finalStatus = dbStatus; // Store final status in JSON
-        } 
-        // --- END OF ADDED BLOCK ---
+        // Logic for basketball game finalization
+        if (liveSession.game_type === 'basketball') {
+            if (finalStatus === 'completed_win') {
+                dbStatus = 'completed_win';
+                const multiplier = gameState.currentMultiplier || 0;
+                const profit = (BigInt(liveSession.bet_amount_lamports) * BigInt(Math.floor(multiplier * 100)) / 100n) - BigInt(liveSession.bet_amount_lamports);
+                finalPayout = BigInt(liveSession.bet_amount_lamports) + profit;
+            } else if (finalStatus === 'completed_cashout') {
+                dbStatus = 'completed_cashout';
+                finalPayout = (BigInt(liveSession.bet_amount_lamports) * BigInt(Math.floor(gameState.currentMultiplier * 100))) / 100n;
+            } else { // bust, timeout, loss
+                dbStatus = 'completed_loss';
+                finalPayout = 0n;
+            }
+            gameState.finalStatus = dbStatus;
+        } 
         else if (finalStatus === 'pvp_resolve') {
             const p1Score = calculateFinalScore(liveSession.game_type, gameState.p1Rolls);
             const p2Score = calculateFinalScore(liveSession.game_type, gameState.p2Rolls);
@@ -591,17 +532,22 @@ async function finalizeGame(session, finalStatus) {
 // ===================================================================
 
 bot.on('callback_query', async (callbackQuery) => {
-    const data = callbackQuery.data;
-    if (!data) return;
+    const data = callbackQuery.data;
+    if (!data) return;
 
-    // --- ADD THIS BLOCK ---
-    if (data.startsWith('simple_hoops_cashout:')) {
+    if (data.startsWith('interactive_roll_request:')) {
         await bot.answerCallbackQuery(callbackQuery.id).catch(() => {});
         const sessionId = data.split(':')[1];
-        await handleSimpleHoopsCashoutHelper(sessionId);
+        const sessionRes = await pool.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [sessionId]);
+        if (sessionRes.rowCount > 0) {
+            const session = sessionRes.rows[0];
+            if(String(session.user_id) !== String(callbackQuery.from.id)) return;
+            // The user clicking this button *is* the roll request.
+            // The main bot's message handler will catch the dice emoji and call the helper.
+            await queuedSendMessage(session.chat_id, `Okay, ${escape(session.game_state_json.p1Name)}! Send a 🏀 emoji to take your next shot.`);
+        }
         return;
     }
-    // --- END OF ADDED BLOCK ---
 
     if (data && data.startsWith('interactive_cashout:')) {
         await bot.answerCallbackQuery(callbackQuery.id, { text: "Cashing out..." }).catch(() => {});
@@ -629,36 +575,23 @@ async function handleNotification(msg) {
         const session = payload.session || payload;
         if (!session) return;
 
-        // The session_id is the key piece of information in the payload
-        const sessionId = session.session_id || session.main_bot_game_id;
-        if (!sessionId) {
-            // In case the payload for roll submitted is just the session ID
-             if(msg.channel === 'interactive_roll_submitted' && typeof payload === 'number') {
-                 sessionId = payload;
-             } else if (msg.channel === 'interactive_roll_submitted' && payload.session_id) {
-                 sessionId = payload.session_id;
-             } else {
-                 return;
-             }
-        }
+        const sessionId = session.session_id || (typeof payload === 'number' ? payload : null);
+        const mainBotGameId = session.main_bot_game_id;
 
         if (msg.channel === 'game_session_pickup') {
-            await handleGameStart(session);
+            const res = await pool.query("SELECT * FROM interactive_game_sessions WHERE main_bot_game_id = $1", [mainBotGameId]);
+            if (res.rows.length > 0) await handleGameStart(res.rows[0]);
         } else if (msg.channel === 'interactive_roll_submitted') {
-            // --- THIS IS THE FIX ---
-            // Fetch the FULL session data from the DB using the ID from the notification
-            const res = await pool.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [sessionId]);
-            if (res.rows.length > 0) {
-                const fullSessionData = res.rows[0];
-                const lastRoll = fullSessionData.game_state_json?.lastRoll;
-                if (typeof lastRoll === 'number') {
-                    // Now pass the COMPLETE session object to the handler
-                    await handleRollSubmitted(fullSessionData, lastRoll);
-                } else {
-                    console.error(`[Helper] Roll notification received for SID:${sessionId}, but lastRoll not found in gameState.`);
-                }
-            }
-            // --- END OF FIX ---
+            const res = await pool.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [sessionId]);
+            if (res.rows.length > 0) {
+                const fullSessionData = res.rows[0];
+                const lastRoll = fullSessionData.game_state_json?.lastRoll;
+                if (typeof lastRoll === 'number') {
+                    await handleRollSubmitted(fullSessionData, lastRoll);
+                } else {
+                    console.error(`[Helper] Roll notification received for SID:${sessionId}, but lastRoll not found in gameState.`);
+                }
+            }
         }
     } catch (e) { console.error('[Helper] Error processing notification payload:', e); }
 }
@@ -705,10 +638,10 @@ async function fetchSolUsdPriceFromCoinGeckoAPI() { try { const response = await
 async function getSolUsdPrice() { const cached = solPriceCache.get(SOL_PRICE_CACHE_KEY); if (cached && (Date.now() - cached.timestamp < SOL_USD_PRICE_CACHE_TTL_MS)) return cached.price; try { const price = await fetchSolUsdPriceFromBinanceAPI(); solPriceCache.set(SOL_PRICE_CACHE_KEY, { price, timestamp: Date.now() }); return price; } catch (e) { try { const price = await fetchSolUsdPriceFromCoinGeckoAPI(); solPriceCache.set(SOL_PRICE_CACHE_KEY, { price, timestamp: Date.now() }); return price; } catch (e2) { if (cached) return cached.price; throw new Error("Could not retrieve SOL/USD price from any source."); } }}
 function convertLamportsToUSDString(lamports, solUsdPrice, d = 2) { if (typeof solUsdPrice !== 'number' || solUsdPrice <= 0) return 'N/A'; const sol = Number(BigInt(lamports)) / Number(LAMPORTS_PER_SOL); return `$${(sol * solUsdPrice).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d })}`;}
 async function formatBalanceForDisplay(lamports, currency = 'USD') { if (currency === 'USD') { try { const price = await getSolUsdPrice(); return convertLamportsToUSDString(lamports, price); } catch (e) { return 'N/A'; } } return `${(Number(BigInt(lamports)) / Number(LAMPORTS_PER_SOL)).toFixed(SOL_DECIMALS)} SOL`;}
-function getPressYourLuckConfig(gameType) { switch(gameType) { case 'bowling': return { maxTurns: BOWLING_FRAMES, effects: KINGPIN_ROLL_EFFECTS, emoji: '🎳' }; case 'darts': return { maxTurns: DARTS_THROWS_TOTAL, effects: BULLSEYE_BLITZ_EFFECTS, emoji: '🎯' }; case 'basketball': return { maxTurns: BASKETBALL_SHOTS_TOTAL, effects: DOWNTOWN_SHOOTOUT_EFFECTS, emoji: '🏀' }; default: return { maxTurns: 1, effects: {}, emoji: '🎲' }; }}
+function getPressYourLuckConfig(gameType) { switch(gameType) { case 'bowling': return { maxTurns: BOWLING_FRAMES, effects: KINGPIN_ROLL_EFFECTS, emoji: '🎳' }; case 'darts': return { maxTurns: DARTS_THROWS_TOTAL, effects: BULLSEYE_BLITZ_EFFECTS, emoji: '🎯' }; case 'basketball': return { maxTurns: BASKETBALL_SHOTS_TOTAL, effects: HOT_STREAK_HOOPS_EFFECTS, emoji: '🏀' }; default: return { maxTurns: 1, effects: {}, emoji: '🎲' }; }}
 function getShotsPerPlayer(gameType) { const lt = String(gameType).toLowerCase(); if (lt.includes('bowling_duel_pvp')) return PVP_BOWLING_FRAMES; if (lt.includes('basketball_clash_pvp')) return PVP_BASKETBALL_SHOTS; if (lt.includes('darts_duel_pvp')) return PVP_DARTS_THROWS; return 1; }
 function calculateFinalScore(gameType, rolls) { const safeRolls = rolls || []; if (safeRolls.length === 0) return 0; if (gameType.includes('basketball')) return safeRolls.filter(r => r >= 4).length; return safeRolls.reduce((a, b) => a + b, 0); }
-function getCleanGameNameHelper(gameType) { if (!gameType) return "Game"; const lt = String(gameType).toLowerCase(); if (lt.includes('bowling_duel_pvp')) return "Bowling Duel"; if (lt.includes('darts_duel_pvp')) return "Darts Showdown"; if (lt.includes('basketball_clash_pvp')) return "3-Point Clash"; if (lt === 'bowling') return "Kingpin's Challenge"; if (lt === 'darts') return "Bullseye Blitz"; if (lt === 'basketball') return "Simple Hoops"; return "Game"; }
+function getCleanGameNameHelper(gameType) { if (!gameType) return "Game"; const lt = String(gameType).toLowerCase(); if (lt.includes('bowling_duel_pvp')) return "Bowling Duel"; if (lt.includes('darts_duel_pvp')) return "Darts Showdown"; if (lt.includes('basketball_clash_pvp')) return "3-Point Clash"; if (lt === 'bowling') return "Kingpin's Challenge"; if (lt === 'darts') return "Bullseye Blitz"; if (lt === 'basketball') return "Hot Streak Hoops"; return "Game"; }
 function getGameEmoji(gameType) { if (gameType.includes('bowling')) return '🎳'; if (gameType.includes('darts')) return '🎯'; if (gameType.includes('basketball')) return '🏀'; return '🎲'; }
 function formatRollsHelper(rolls) { if (!rolls || rolls.length === 0) return '...'; return rolls.map(r => `<b>${r}</b>`).join(' '); }
 
