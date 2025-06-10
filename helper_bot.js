@@ -1,4 +1,4 @@
-// helper_bot.js - FINAL UNIFIED VERSION v21 - New Kingpin's Challenge Logic
+// helper_bot.js - FINAL UNIFIED VERSION v22 - 5-Frame Bowling & UI Updates
 
 import 'dotenv/config';
 import TelegramBot from 'node-telegram-bot-api';
@@ -29,7 +29,7 @@ const activeTurnTimeouts = new Map();
 
 // --- Game Constants ---
 // REVISED: Kingpin's Challenge (PvB Bowling) Constants
-const NEW_BOWLING_FRAMES = 3;
+const NEW_BOWLING_FRAMES = 5; // UPDATED: Changed from 3 to 5 frames
 const NEW_BOWLING_PINS_PER_ROLL = {
     // Roll: Pins Knocked Down
     5: 8,
@@ -171,10 +171,12 @@ async function updateRoundBasedHoopsMessage(sessionId) {
             const shotsRemaining = ROUND_BASED_HOOPS_SHOTS_PER_ROUND - gameState.shotsTakenInRound;
             promptHTML = `Please send <b>${shotsRemaining}</b> 🏀 emoji(s) to play Round ${gameState.currentRound}.`;
         } else if (gameState.status === 'awaiting_cashout_decision') {
-            promptHTML = `<b>Round ${gameState.currentRound - 1} Complete!</b>\nSend 🏀 to start the next round, or cash out now.`;
-            keyboardRows.push([
-                { text: `💰 Cash Out (${escape(currentPayoutDisplay)})`, callback_data: `interactive_cashout:${sessionId}` }
-            ]);
+            // UPDATED: New prompt and button layout
+            promptHTML = `<b>Round ${gameState.currentRound - 1} Complete!</b>\nWhat's your next move?`;
+            keyboardRows.push(
+                [{ text: `💰 Cash Out (${escape(currentPayoutDisplay)})`, callback_data: `interactive_cashout:${sessionId}` }],
+                [{ text: `▶️ Start Next Round`, callback_data: `interactive_continue:${sessionId}` }]
+            );
         }
 
         // Add timeout information to the prompt
@@ -206,12 +208,7 @@ async function handleRoundBasedHoopsRoll(session, rollValue) {
     const logPrefix = `[HandleRoundBasedHoopsRoll SID:${session.session_id}]`;
     const gameState = session.game_state_json;
 
-    // If player sends a roll when they should be making a decision, treat it as continuing.
-    if (gameState.status === 'awaiting_cashout_decision') {
-        gameState.shotsTakenInRound = 0; // Reset for the new round
-        gameState.status = 'awaiting_shots';
-    }
-
+    // UPDATED: Removed logic that treats a roll as "continue". Action is now explicit via button.
     if (gameState.status !== 'awaiting_shots') return;
 
     const effect = ROUND_BASED_HOOPS_EFFECTS[rollValue];
@@ -334,10 +331,11 @@ async function updateKingpinsChallengeMessage(sessionId) {
 
         if (gameState.status === 'awaiting_cashout_decision') {
             promptHTML = `<i>Frame ${gameState.currentFrame - 1} complete! Risk it or cash out?</i>`;
-            keyboardRows.push([
-                { text: `💰 Cash Out (${escape(currentPayoutDisplay)})`, callback_data: `interactive_cashout:${sessionId}` },
-                { text: `▶️ Bowl Next Frame`, callback_data: `interactive_continue:${sessionId}` }
-            ]);
+            // UPDATED: Buttons are now stacked vertically
+            keyboardRows.push(
+                [{ text: `💰 Cash Out (${escape(currentPayoutDisplay)})`, callback_data: `interactive_cashout:${sessionId}` }],
+                [{ text: `▶️ Bowl Next Frame`, callback_data: `interactive_continue:${sessionId}` }]
+            );
         } else { // Awaiting first shot of the game
             promptHTML = `<i>Frame ${gameState.currentFrame}/${NEW_BOWLING_FRAMES}. Send a 🎳 to bowl your first shot!</i>`;
         }
@@ -794,12 +792,20 @@ bot.on('callback_query', async (callbackQuery) => {
         if (res.rowCount > 0 && res.rows[0].status === 'in_progress') {
             const session = res.rows[0];
             if(String(session.user_id) !== fromId) return;
-            
+
             const gameState = session.game_state_json;
-            if (session.game_type === 'bowling' && gameState.status === 'awaiting_cashout_decision') {
+            const gameType = session.game_type;
+
+            // UPDATED: Added handler for basketball continue
+            if (gameType === 'bowling' && gameState.status === 'awaiting_cashout_decision') {
                 gameState.status = 'awaiting_first_shot';
                 await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
                 await updateKingpinsChallengeMessage(session.session_id);
+            } else if (gameType === 'basketball' && gameState.status === 'awaiting_cashout_decision') {
+                gameState.shotsTakenInRound = 0;
+                gameState.status = 'awaiting_shots';
+                await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
+                await updateRoundBasedHoopsMessage(session.session_id);
             }
         }
     }
