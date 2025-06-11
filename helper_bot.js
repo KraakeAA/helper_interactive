@@ -160,20 +160,49 @@ function getPvBTotalTurns(gameType) {
 }
 
 // Starts the game and calls the message updater for the first time.
-async function runPvBGame(session) {
-    const gameState = session.game_state_json;
-    gameState.playerScore = 0;
-    gameState.botScore = 0;
-    gameState.playerRolls = [];
-    gameState.botRolls = [];
-    gameState.currentTurn = 1;
+async function updatePvBGameBoard(sessionId, introText = null) {
+    const logPrefix = `[UpdatePvBBoardV2 SID:${sessionId}]`;
+    let client = null;
+    try {
+        client = await pool.connect();
+        const res = await client.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [sessionId]);
+        if (res.rowCount === 0) {
+            console.warn(`${logPrefix} Session not found, cannot update board.`);
+            return;
+        }
 
-    await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
-    
-    // Create the initial game board message
-    await updatePvBGameBoard(session.session_id, {
-        intro: `🔥 <b>${escape(getCleanGameNameHelper(session.game_type))} vs. The Bot</b> 🔥\n\nWager: <b>${escape(await formatBalanceForDisplay(session.bet_amount_lamports, 'USD'))}</b>\n`
-    });
+        const session = res.rows[0];
+        const gameState = session.game_state_json;
+        const totalTurns = getPvBTotalTurns(session.game_type);
+        const emoji = getGameEmoji(session.game_type);
+
+        // Build the message content with new visuals
+        let messageHTML = introText || `🔥🏀 <b>${escape(getCleanGameNameHelper(session.game_type))} vs. The Bot</b> 🏀🔥\n\n`;
+
+        // Display the results from the last round if they exist
+        if (gameState.lastRoundResult) {
+            messageHTML += `<i>Last Round: ${gameState.lastRoundResult}</i>\n\n`;
+        }
+
+        messageHTML += `--- <b>Round ${gameState.currentTurn} of ${totalTurns}</b> ---\n`;
+        messageHTML += `<b>Score:</b> ${escape(gameState.p1Name)} <b>${gameState.playerScore}</b> - <b>${gameState.botScore}</b> Bot 🤖\n\n`;
+        messageHTML += `It's your turn, <b>${escape(gameState.p1Name)}</b>! Send a ${emoji} emoji **in this chat** to take your shot.`;
+
+        const options = { parse_mode: 'HTML' };
+        
+        // Always send a new message for the round prompt
+        const newMsg = await queuedSendMessage(session.chat_id, messageHTML, options);
+
+        // Save the ID of this new message so it can be deleted before the next round's message
+        if (newMsg) {
+            gameState.gameBoardMessageId = newMsg.message_id;
+            await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), sessionId]);
+        }
+    } catch (error) {
+        console.error(`${logPrefix} Error updating game board: ${error.message}`);
+    } finally {
+        if (client) client.release();
+    }
 }
 
 // The new central function for sending and editing the Game Board message.
@@ -231,61 +260,61 @@ async function updatePvBGameBoard(sessionId, override = {}) {
 
 // The rewritten turn handler with message editing and the requested delay.
 async function handlePvBRoll(session, playerRollValue) {
-    const { chat_id, game_type, game_state_json: gameState } = session;
+    const { chat_id, game_type, game_state_json: gameState, session_id } = session;
     const emoji = getGameEmoji(game_type);
+    const logPrefix = `[HandlePvBRollV2 SID:${session_id}]`;
 
     try {
-        // 1. Acknowledge player's roll by editing the main message.
-        await updatePvBGameBoard(session.session_id, { status: `You threw a ${playerRollValue}... Bot is thinking...` });
+        // 1. Delete the prompt message for the round that just finished
+        if (gameState.gameBoardMessageId) {
+            await bot.deleteMessage(chat_id, gameState.gameBoardMessageId).catch(() => {});
+        }
 
-        // 2. Wait for the user-requested 2 seconds.
-        await sleep(2000);
+        // 2. Acknowledge player's roll & send bot's dice
+        const playerRef = escape(gameState.p1Name);
+        const thinkingMsg = await queuedSendMessage(chat_id, `🏀 ${playerRef} shoots... you rolled a <b>${playerRollValue}</b>! The bot takes its shot...`, { parse_mode: 'HTML' });
 
-        // 3. Bot takes its turn VISIBLY.
         const botDiceMessage = await queuedSendDice(chat_id, { emoji });
         if (!botDiceMessage || !botDiceMessage.dice) {
             throw new Error("Failed to send bot's dice roll message.");
         }
         const botRollValue = botDiceMessage.dice.value;
-        
-        // 4. Wait for the bot's dice animation to finish.
-        await sleep(2500);
 
-        // 5. Calculate points for this round.
-        let playerResultPoints = 0;
-        let botResultPoints = 0;
+        await sleep(2500); // Wait for dice animation
 
-        if (game_type === 'bowling') {
-            playerResultPoints = PVB_BOWLING_SCORES[playerRollValue] || 0;
-            botResultPoints = PVB_BOWLING_SCORES[botRollValue] || 0;
-        } else if (game_type === 'basketball') {
-            playerResultPoints = (playerRollValue >= 4) ? 1 : 0;
-            botResultPoints = (botRollValue >= 3) ? 1 : 0;
-        } else if (game_type === 'darts') {
-            playerResultPoints = DARTS_501_POINTS_PER_ROLL[playerRollValue] || 0;
-            botResultPoints = DARTS_501_POINTS_PER_ROLL[botRollValue] || 0;
-        }
-        
-        // 6. Update the game state in memory.
+        // 3. Clean up the temporary messages
+        if (thinkingMsg) await bot.deleteMessage(chat_id, thinkingMsg.message_id).catch(() => {});
+        if (botDiceMessage) await bot.deleteMessage(chat_id, botDiceMessage.message_id).catch(() => {});
+
+        // 4. Calculate points for this round
+        let playerResultPoints = (playerRollValue >= 4) ? 1 : 0;
+        let botResultPoints = (botRollValue >= 3) ? 1 : 0;
+
+        // 5. Update game state
         gameState.playerRolls.push(playerRollValue);
         gameState.botRolls.push(botRollValue);
         gameState.playerScore += playerResultPoints;
         gameState.botScore += botResultPoints;
+        
+        // 6. Create the result summary string for the message
+        const playerShotResult = playerResultPoints > 0 ? "You scored!" : "You missed.";
+        const botShotResult = botResultPoints > 0 ? "Bot scores." : "Bot missed.";
+        gameState.lastRoundResult = `${playerShotResult} (${playerRollValue}) | ${botShotResult} (${botRollValue})`;
 
-        // 7. Check if the game is over.
+        // 7. Check if the game is over
         const totalTurns = getPvBTotalTurns(game_type);
         const isGameOver = (gameState.currentTurn >= totalTurns);
-        
-        // 8. Proceed to the next state.
+
+        // 8. Proceed to the next state
         if (isGameOver) {
             await finalizeGame(session, 'pvb_resolve', gameState);
         } else {
             gameState.currentTurn++;
             await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
-            await updatePvBGameBoard(session.session_id); // Update board for the next turn.
+            await updatePvBGameBoard(session.session_id); // This will now post the new combined message for the next round
         }
     } catch (error) {
-        console.error(`[handlePvBRoll] Error during bot's turn: ${error.message}. Finalizing game with error state.`);
+        console.error(`${logPrefix} Error during bot's turn: ${error.message}. Finalizing game with error state.`);
         await finalizeGame(session, 'error', gameState);
     }
 }
