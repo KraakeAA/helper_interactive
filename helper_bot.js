@@ -160,49 +160,25 @@ function getPvBTotalTurns(gameType) {
 }
 
 // Starts the game and calls the message updater for the first time.
-async function updatePvBGameBoard(sessionId, introText = null) {
-    const logPrefix = `[UpdatePvBBoardV2 SID:${sessionId}]`;
-    let client = null;
-    try {
-        client = await pool.connect();
-        const res = await client.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [sessionId]);
-        if (res.rowCount === 0) {
-            console.warn(`${logPrefix} Session not found, cannot update board.`);
-            return;
-        }
+// in helper_bot.js - REPLACE this function
+async function runPvBGame(session) {
+    const gameState = session.game_state_json;
+    gameState.playerScore = 0;
+    gameState.botScore = 0;
+    gameState.playerRolls = [];
+    gameState.botRolls = [];
+    gameState.currentTurn = 1;
+    gameState.lastRoundResult = null; // Initialize last round result
 
-        const session = res.rows[0];
-        const gameState = session.game_state_json;
-        const totalTurns = getPvBTotalTurns(session.game_type);
-        const emoji = getGameEmoji(session.game_type);
-
-        // Build the message content with new visuals
-        let messageHTML = introText || `🔥🏀 <b>${escape(getCleanGameNameHelper(session.game_type))} vs. The Bot</b> 🏀🔥\n\n`;
-
-        // Display the results from the last round if they exist
-        if (gameState.lastRoundResult) {
-            messageHTML += `<i>Last Round: ${gameState.lastRoundResult}</i>\n\n`;
-        }
-
-        messageHTML += `--- <b>Round ${gameState.currentTurn} of ${totalTurns}</b> ---\n`;
-        messageHTML += `<b>Score:</b> ${escape(gameState.p1Name)} <b>${gameState.playerScore}</b> - <b>${gameState.botScore}</b> Bot 🤖\n\n`;
-        messageHTML += `It's your turn, <b>${escape(gameState.p1Name)}</b>! Send a ${emoji} emoji **in this chat** to take your shot.`;
-
-        const options = { parse_mode: 'HTML' };
-        
-        // Always send a new message for the round prompt
-        const newMsg = await queuedSendMessage(session.chat_id, messageHTML, options);
-
-        // Save the ID of this new message so it can be deleted before the next round's message
-        if (newMsg) {
-            gameState.gameBoardMessageId = newMsg.message_id;
-            await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), sessionId]);
-        }
-    } catch (error) {
-        console.error(`${logPrefix} Error updating game board: ${error.message}`);
-    } finally {
-        if (client) client.release();
-    }
+    // Save the initialized state to the database
+    await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
+    
+    // Create the initial game board message to prompt the user for Round 1
+    const gameName = getCleanGameNameHelper(session.game_type);
+    const betDisplay = await formatBalanceForDisplay(session.bet_amount_lamports, 'USD');
+    const introText = `🔥🏀 <b>${escape(gameName)} vs. The Bot</b> 🏀🔥\n\nWager: <b>${escape(betDisplay)}</b>\n`;
+    
+    await updatePvBGameBoard(session.session_id, introText);
 }
 
 // The new central function for sending and editing the Game Board message.
