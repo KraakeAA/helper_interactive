@@ -279,6 +279,71 @@ async function handlePvBRoll(session, playerRollValue) {
 
 
 // --- GAME ENGINE & STATE MACHINE ---
+// in helper_bot.js - NEW function
+async function updateInteractivePvPGameBoard(sessionId) {
+    const logPrefix = `[UpdatePvPBoard_V1 SID:${sessionId}]`;
+    let client = null;
+    try {
+        client = await pool.connect();
+        const res = await client.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [sessionId]);
+        if (res.rowCount === 0) return;
+
+        const session = res.rows[0];
+        const gameState = session.game_state_json;
+        const gameName = getCleanGameNameHelper(session.game_type);
+        const emoji = getGameEmoji(session.game_type);
+        const totalTurns = getShotsPerPlayer(session.game_type);
+
+        const p1Name = escape(gameState.initiatorName || "Player 1");
+        const p2Name = escape(gameState.opponentName || "Player 2");
+        const p1Score = calculateFinalScore(session.game_type, gameState.p1Rolls);
+        const p2Score = calculateFinalScore(session.game_type, gameState.p2Rolls);
+
+        let messageHTML = `⚔️ <b>${escape(gameName)}</b>: ${p1Name} vs. ${p2Name} ⚔️\n\n`;
+
+        // Scoreboard
+        messageHTML += `<b>${p1Name}:</b> ${p1Score} pts <i>(${(gameState.p1Rolls || []).length}/${totalTurns} throws)</i>\n`;
+        messageHTML += `<b>${p2Name}:</b> ${p2Score} pts <i>(${(gameState.p2Rolls || []).length}/${totalTurns} throws)</i>\n\n`;
+
+        // Action Prompt
+        const activePlayerName = (String(gameState.currentPlayerTurn) === String(gameState.initiatorId)) ? p1Name : p2Name;
+        messageHTML += `It's your turn, <b>${activePlayerName}</b>! Send a ${emoji} to roll.`;
+        
+        const messageId = gameState.gameBoardMessageId;
+        const options = { chat_id: session.chat_id, parse_mode: 'HTML' };
+        
+        if (messageId) {
+            options.message_id = messageId;
+            await bot.editMessageText(messageHTML, options).catch(async (err) => {
+                // If editing fails (e.g., message deleted), send a new one.
+                if (err.code !== 'ETELEGRAM' || !err.message.includes("message is not modified")) {
+                    console.warn(`${logPrefix} Edit failed, sending new message. Error: ${err.message}`);
+                    const newMsg = await queuedSendMessage(session.chat_id, messageHTML, { parse_mode: 'HTML' });
+                    if (newMsg) {
+                        gameState.gameBoardMessageId = newMsg.message_id;
+                        await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), sessionId]);
+                    }
+                }
+            });
+        } else {
+            const newMsg = await queuedSendMessage(session.chat_id, messageHTML, { parse_mode: 'HTML' });
+            if (newMsg) {
+                gameState.gameBoardMessageId = newMsg.message_id;
+                await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), sessionId]);
+            }
+        }
+
+        // Set timeout for the active player
+        if (activeTurnTimeouts.has(sessionId)) clearTimeout(activeTurnTimeouts.get(sessionId));
+        const timeoutId = setTimeout(() => handleGameTimeout(sessionId), PLAYER_ACTION_TIMEOUT);
+        activeTurnTimeouts.set(sessionId, timeoutId);
+
+    } catch (error) {
+        console.error(`${logPrefix} Error: ${error.message}`);
+    } finally {
+        if (client) client.release();
+    }
+}
 async function handleGameStart(session) {
     const logPrefix = `[HandleStart SID:${session.session_id}]`;
     console.log(`${logPrefix} Initializing game: ${session.game_type}`);
@@ -321,54 +386,78 @@ async function handleGameStart(session) {
         }
     } catch (e) { if (client) await client.query('ROLLBACK'); console.error(`${logPrefix} Error initializing game: ${e.message}`); } finally { if (client) client.release(); }
 }
+// in helper_bot.js - REPLACEMENT for advancePvPGameState
 async function advancePvPGameState(sessionId) {
-    const res = await pool.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1 FOR UPDATE", [sessionId]);
-    if (res.rowCount === 0 || res.rows[0].status !== 'in_progress') return;
-    const session = res.rows[0];
-    const gameState = session.game_state_json || {};
-    const shotsPerPlayer = getShotsPerPlayer(session.game_type);
-    const p1_done = (gameState.p1Rolls || []).length >= shotsPerPlayer;
-    const p2_done = (gameState.p2Rolls || []).length >= shotsPerPlayer;
-    if (p1_done && p2_done) { await finalizeGame(session, 'pvp_resolve'); return; }
-    gameState.currentPlayerTurn = !p1_done ? String(gameState.initiatorId) : String(gameState.opponentId);
-    await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), sessionId]);
-    await promptPvPAction(session, gameState);
+    let client = null;
+    try {
+        client = await pool.connect();
+        const res = await client.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1 FOR UPDATE", [sessionId]);
+        if (res.rowCount === 0 || res.rows[0].status !== 'in_progress') return;
+
+        const session = res.rows[0];
+        const gameState = session.game_state_json || {};
+        const shotsPerPlayer = getShotsPerPlayer(session.game_type);
+
+        const p1_done = (gameState.p1Rolls || []).length >= shotsPerPlayer;
+        const p2_done = (gameState.p2Rolls || []).length >= shotsPerPlayer;
+
+        if (p1_done && p2_done) {
+            await finalizeGame(session, 'pvp_resolve');
+            return;
+        }
+
+        // Determine the next player and update the state
+        gameState.currentPlayerTurn = !p1_done ? String(gameState.initiatorId) : String(gameState.opponentId);
+        await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), sessionId]);
+        
+        // Call the new unified message updater
+        await updateInteractivePvPGameBoard(sessionId);
+
+    } catch (error) {
+        console.error(`[AdvancePvPState SID:${sessionId}] Error: ${error.message}`);
+    } finally {
+        if (client) client.release();
+    }
 }
-async function promptPvPAction(session, gameState) {
-    const { chat_id, game_type } = session;
-    const { p1Name, p2Name, p1Rolls, p2Rolls, currentPlayerTurn, initiatorId, gameBoardMessageId } = gameState;
-    const gameName = getCleanGameNameHelper(game_type);
-    const emoji = getGameEmoji(game_type);
-    const shotsPerPlayer = getShotsPerPlayer(game_type);
-    const p1Score = calculateFinalScore(game_type, p1Rolls);
-    const p2Score = calculateFinalScore(game_type, p2Rolls);
-    const nextPlayerName = (String(currentPlayerTurn) === String(initiatorId)) ? p1Name : p2Name;
-    const nextPlayerRolls = (String(currentPlayerTurn) === String(initiatorId)) ? (p1Rolls || []) : (p2Rolls || []);
-    
-    if (gameBoardMessageId) {
-        bot.deleteMessage(chat_id, gameBoardMessageId).catch(() => {});
+// in helper_bot.js - REPLACEMENT for handleRollSubmitted
+async function handleRollSubmitted(session) {
+    const gameState = session.game_state_json || {};
+    const { lastRoll, lastRollerId } = gameState;
+    const logPrefix = `[HandleRollSubmitted_V2_Validate SID:${session.session_id}]`;
+
+    if (typeof lastRoll !== 'number' || !lastRollerId) {
+        console.warn(`${logPrefix} Received notification but lastRoll/lastRollerId is missing from game state.`);
+        return;
     }
 
-    let scoreBoardHTML = `<b>${p1Name}:</b> ${formatRollsHelper(p1Rolls || [])} ➠ Score: <b>${p1Score}</b>\n` + `<b>${p2Name}:</b> ${formatRollsHelper(p2Rolls || [])} ➠ Score: <b>${p2Score}</b>`;
-    let messageHTML = `⚔️ <b>${gameName}</b> ⚔️\n\n${scoreBoardHTML}\n\n` + `It's your turn, <b>${nextPlayerName}</b>! Send a ${emoji} **in this chat** to roll (Roll ${nextPlayerRolls.length + 1} of ${shotsPerPlayer}).`;
-    
-    const sentMsg = await queuedSendMessage(chat_id, messageHTML, { parse_mode: 'HTML' });
-    if (sentMsg) {
-        gameState.gameBoardMessageId = sentMsg.message_id;
-        await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
+    // *** NEW: Turn Validation Logic Moved Here ***
+    if (String(gameState.currentPlayerTurn) !== String(lastRollerId)) {
+        console.log(`${logPrefix} Roll from UID ${lastRollerId}, but it's UID ${gameState.currentPlayerTurn}'s turn. Ignoring.`);
+        await queuedSendMessage(session.chat_id, "<i>It's not your turn to roll!</i>", { parse_mode: 'HTML' })
+            .then(msg => setTimeout(() => bot.deleteMessage(session.chat_id, msg.message_id).catch(() => {}), 4000))
+            .catch(()=>{});
+        return;
     }
-}
-async function handleRollSubmitted(session, lastRoll) {
-    if (session.status !== 'in_progress') return;
-    const gameState = session.game_state_json || {};
+    // *** END OF NEW VALIDATION ***
+
+    // Clear the timeout for the player who just successfully rolled
+    if (activeTurnTimeouts.has(session.session_id)) {
+        clearTimeout(activeTurnTimeouts.get(session.session_id));
+        activeTurnTimeouts.delete(session.session_id);
+    }
 
     if (session.game_type.includes('_pvp')) {
         const playerKey = (String(gameState.initiatorId) === gameState.currentPlayerTurn) ? 'p1' : 'p2';
         if (!gameState[`${playerKey}Rolls`]) gameState[`${playerKey}Rolls`] = [];
         gameState[`${playerKey}Rolls`].push(lastRoll);
+        
+        // Persist the new roll to the database *before* advancing the state
         await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
+        
         await advancePvPGameState(session.session_id);
+
     } else if (['bowling', 'basketball', 'darts'].includes(session.game_type)) {
+        // The PvB handler can now be simpler as the roll value is already in the game state
         await handlePvBRoll(session, lastRoll);
     }
 }
