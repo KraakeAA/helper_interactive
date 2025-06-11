@@ -419,27 +419,32 @@ async function advancePvPGameState(sessionId) {
         if (client) client.release();
     }
 }
-// in helper_bot.js - REPLACEMENT for handleRollSubmitted
+// in helper_bot.js - REPLACEMENT for handleRollSubmitted with debug logging
+
 async function handleRollSubmitted(session, lastRoll, lastRollerId) {
     const gameState = session.game_state_json || {};
-    const logPrefix = `[HandleRollSubmitted_V3_Owner SID:${session.session_id}]`;
+    const logPrefix = `[HandleRollSubmitted_V4_Debug SID:${session.session_id}]`;
 
-    // *** Turn Validation Logic is now owned by the Helper Bot ***
+    // --- NEW: Detailed Debug Logging ---
+    console.log(`${logPrefix} Received roll data. Roller ID: ${lastRollerId}, Dice Value: ${lastRoll}`);
+    console.log(`${logPrefix} Current game state expects turn from: ${gameState.currentPlayerTurn}`);
+    // --- END: Detailed Debug Logging ---
+
     if (String(gameState.currentPlayerTurn) !== String(lastRollerId)) {
-        console.log(`${logPrefix} Roll from UID ${lastRollerId}, but it's UID ${gameState.currentPlayerTurn}'s turn. Ignoring.`);
+        console.warn(`${logPrefix} VALIDATION FAILED. Expected turn from ${gameState.currentPlayerTurn}, but roll came from ${lastRollerId}. Ignoring.`);
         await queuedSendMessage(session.chat_id, "<i>It's not your turn to roll!</i>", { parse_mode: 'HTML' })
             .then(msg => setTimeout(() => bot.deleteMessage(session.chat_id, msg.message_id).catch(() => {}), 4000))
             .catch(()=>{});
         return;
     }
     
-    // Clear the timeout for the player who just successfully rolled
+    console.log(`${logPrefix} Turn validation PASSED.`);
+
     if (activeTurnTimeouts.has(session.session_id)) {
         clearTimeout(activeTurnTimeouts.get(session.session_id));
         activeTurnTimeouts.delete(session.session_id);
     }
 
-    // This part remains the same, but is now more reliable
     if (session.game_type.includes('_pvp')) {
         const playerKey = (String(gameState.initiatorId) === gameState.currentPlayerTurn) ? 'p1' : 'p2';
         if (!gameState[`${playerKey}Rolls`]) gameState[`${playerKey}Rolls`] = [];
