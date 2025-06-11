@@ -420,17 +420,11 @@ async function advancePvPGameState(sessionId) {
     }
 }
 // in helper_bot.js - REPLACEMENT for handleRollSubmitted
-async function handleRollSubmitted(session) {
+async function handleRollSubmitted(session, lastRoll, lastRollerId) {
     const gameState = session.game_state_json || {};
-    const { lastRoll, lastRollerId } = gameState;
-    const logPrefix = `[HandleRollSubmitted_V2_Validate SID:${session.session_id}]`;
+    const logPrefix = `[HandleRollSubmitted_V3_Owner SID:${session.session_id}]`;
 
-    if (typeof lastRoll !== 'number' || !lastRollerId) {
-        console.warn(`${logPrefix} Received notification but lastRoll/lastRollerId is missing from game state.`);
-        return;
-    }
-
-    // *** NEW: Turn Validation Logic Moved Here ***
+    // *** Turn Validation Logic is now owned by the Helper Bot ***
     if (String(gameState.currentPlayerTurn) !== String(lastRollerId)) {
         console.log(`${logPrefix} Roll from UID ${lastRollerId}, but it's UID ${gameState.currentPlayerTurn}'s turn. Ignoring.`);
         await queuedSendMessage(session.chat_id, "<i>It's not your turn to roll!</i>", { parse_mode: 'HTML' })
@@ -438,26 +432,24 @@ async function handleRollSubmitted(session) {
             .catch(()=>{});
         return;
     }
-    // *** END OF NEW VALIDATION ***
-
+    
     // Clear the timeout for the player who just successfully rolled
     if (activeTurnTimeouts.has(session.session_id)) {
         clearTimeout(activeTurnTimeouts.get(session.session_id));
         activeTurnTimeouts.delete(session.session_id);
     }
 
+    // This part remains the same, but is now more reliable
     if (session.game_type.includes('_pvp')) {
         const playerKey = (String(gameState.initiatorId) === gameState.currentPlayerTurn) ? 'p1' : 'p2';
         if (!gameState[`${playerKey}Rolls`]) gameState[`${playerKey}Rolls`] = [];
         gameState[`${playerKey}Rolls`].push(lastRoll);
         
-        // Persist the new roll to the database *before* advancing the state
         await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
         
         await advancePvPGameState(session.session_id);
 
     } else if (['bowling', 'basketball', 'darts'].includes(session.game_type)) {
-        // The PvB handler can now be simpler as the roll value is already in the game state
         await handlePvBRoll(session, lastRoll);
     }
 }
@@ -560,25 +552,33 @@ async function handleGameTimeout(sessionId) {
     const res = await pool.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [sessionId]);
     if (res.rowCount > 0 && res.rows[0].status === 'in_progress') { await finalizeGame(res.rows[0], 'completed_timeout'); }
 }
+// in helper_bot.js - REPLACEMENT for handleNotification
 async function handleNotification(msg) {
     try {
         const payload = JSON.parse(msg.payload);
-        const mainBotGameId = payload.session?.main_bot_game_id || payload.main_bot_game_id;
-        const sessionId = payload.session?.session_id || payload.session_id;
+        const mainBotGameId = payload.main_bot_game_id;
 
         if (msg.channel === 'game_session_pickup' && mainBotGameId) {
             const res = await pool.query("SELECT * FROM interactive_game_sessions WHERE main_bot_game_id = $1", [mainBotGameId]);
             if (res.rows.length > 0) await handleGameStart(res.rows[0]);
-        } else if (msg.channel === 'interactive_roll_submitted' && sessionId) {
-            const res = await pool.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [sessionId]);
+
+        } else if (msg.channel === 'interactive_roll_submitted' && mainBotGameId) {
+            // --- NEW LOGIC: Handle the roll data directly from the notification ---
+            const { rollerId, diceValue } = payload;
+            if (typeof diceValue !== 'number' || !rollerId) {
+                console.warn(`[Helper NOTIFY] Invalid roll payload received for GID ${mainBotGameId}`, payload);
+                return;
+            }
+            
+            const res = await pool.query("SELECT * FROM interactive_game_sessions WHERE main_bot_game_id = $1 AND status = 'in_progress'", [mainBotGameId]);
             if (res.rows.length > 0) {
-                const lastRoll = res.rows[0].game_state_json?.lastRoll;
-                if (typeof lastRoll === 'number') {
-                    await handleRollSubmitted(res.rows[0], lastRoll);
-                }
+                // Pass the session and the roll data to the handler
+                await handleRollSubmitted(res.rows[0], diceValue, rollerId);
             }
         }
-    } catch (e) { console.error('[Helper] Error processing notification payload:', e); }
+    } catch (e) {
+        console.error('[Helper] Error processing notification payload:', e);
+    }
 }
 async function setupNotificationListeners() {
     console.log("⚙️ [Helper] Setting up notification listeners...");
