@@ -589,20 +589,35 @@ async function setupNotificationListeners() {
     await listeningClient.query('LISTEN interactive_roll_submitted');
     console.log("✅ [Helper] Now listening for 'game_session_pickup' and 'interactive_roll_submitted'.");
 }
+// in helper_bot.js - REPLACEMENT for processPendingGames
 async function processPendingGames() {
+    // This is now a robust fallback poller.
     if (processPendingGames.isRunning) return;
     processPendingGames.isRunning = true;
+    const logPrefix = `[Helper Fallback Poller]`;
+    console.log(`${logPrefix} Running check for stranded games...`); // Heartbeat log
+
     let client = null;
     try {
         client = await pool.connect();
-        const pendingSessions = await client.query("SELECT * FROM interactive_game_sessions WHERE status = 'pending_pickup' ORDER BY created_at ASC LIMIT 5");
-        for (const session of pendingSessions.rows) {
-            await client.query(`NOTIFY game_session_pickup, '${JSON.stringify({ session: session })}'`);
+        // Find games that have been pending for more than a few seconds, in case NOTIFY was missed.
+        const pendingSessions = await client.query("SELECT * FROM interactive_game_sessions WHERE status = 'pending_pickup' AND created_at < NOW() - INTERVAL '5 seconds' ORDER BY created_at ASC LIMIT 5");
+        
+        if (pendingSessions.rowCount > 0) {
+            console.log(`${logPrefix} Found ${pendingSessions.rowCount} stranded game(s). Starting them directly.`);
+            for (const session of pendingSessions.rows) {
+                // --- THIS IS THE FIX: Directly call the handler, don't re-notify ---
+                await handleGameStart(session);
+            }
         }
-    } catch (e) { console.error(`[Helper Fallback Poller] Error: ${e.message}`); } finally { if (client) client.release(); processPendingGames.isRunning = false; }
+    } catch (e) {
+        console.error(`${logPrefix} Error: ${e.message}`);
+    } finally {
+        if (client) client.release();
+        processPendingGames.isRunning = false;
+    }
 }
-processPendingGames.isRunning = false;
-
+processPendingGames.isRunning = false; // Initialize the flag
 // --- UTILITY FUNCTIONS ---
 function escape(text) { if (text === null || typeof text === 'undefined') return ''; return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');}
 async function getSolUsdPrice() { const cached = solPriceCache.get(SOL_PRICE_CACHE_KEY); if (cached && (Date.now() - cached.timestamp < SOL_USD_PRICE_CACHE_TTL_MS)) return cached.price; try { const price = parseFloat((await axios.get('https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT', { timeout: 8000 })).data?.price); solPriceCache.set(SOL_PRICE_CACHE_KEY, { price, timestamp: Date.now() }); return price; } catch (e) { try { const price = parseFloat((await axios.get('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd', { timeout: 8000 })).data?.solana?.usd); solPriceCache.set(SOL_PRICE_CACHE_KEY, { price, timestamp: Date.now() }); return parseFloat(price); } catch (e2) { if (cached) return cached.price; throw new Error("Could not retrieve SOL/USD price."); } }}
