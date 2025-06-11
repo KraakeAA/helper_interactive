@@ -557,74 +557,6 @@ async function handleGameTimeout(sessionId) {
     const res = await pool.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [sessionId]);
     if (res.rowCount > 0 && res.rows[0].status === 'in_progress') { await finalizeGame(res.rows[0], 'completed_timeout'); }
 }
-// in helper_bot.js - REPLACEMENT for processPendingGames
-async function processPendingGames() {
-    if (processPendingGames.isRunning) return;
-    processPendingGames.isRunning = true;
-    const logPrefix = `[Helper Game Pickup Poller]`;
-    console.log(`${logPrefix} Running check for new games...`);
-
-    let client = null;
-    try {
-        client = await pool.connect();
-        // Find games that are pending pickup
-        const pendingSessions = await client.query("SELECT * FROM interactive_game_sessions WHERE status = 'pending_pickup' ORDER BY created_at ASC LIMIT 5");
-        
-        if (pendingSessions.rowCount > 0) {
-            console.log(`${logPrefix} Found ${pendingSessions.rowCount} new game(s) to start.`);
-            for (const session of pendingSessions.rows) {
-                // Directly call the start handler instead of re-notifying
-                await handleGameStart(session);
-            }
-        }
-    } catch (e) {
-        console.error(`${logPrefix} Error: ${e.message}`);
-    } finally {
-        if (client) client.release();
-        processPendingGames.isRunning = false;
-    }
-}
-processPendingGames.isRunning = false; // Initialize the flag
-// in helper_bot.js - NEW function for polling rolls
-async function pollForSubmittedRolls() {
-    if (pollForSubmittedRolls.isRunning) return;
-    pollForSubmittedRolls.isRunning = true;
-    const logPrefix = '[Helper Roll Poller]';
-    let client = null;
-
-    try {
-        client = await pool.connect();
-        // Find games where the updated_at is very recent and there's a lastRollerId
-        // This means the main bot has just updated it with a new roll.
-        const res = await client.query(`
-            SELECT * FROM interactive_game_sessions 
-            WHERE status = 'in_progress' 
-              AND game_state_json->>'lastRollerId' IS NOT NULL
-              AND updated_at > NOW() - INTERVAL '4 seconds'
-        `);
-
-        if (res.rowCount > 0) {
-            for (const session of res.rows) {
-                const gameState = session.game_state_json;
-                const { lastRoll, lastRollerId } = gameState;
-
-                // IMPORTANT: Clear the roll data to prevent re-processing on the next poll
-                delete gameState.lastRoll;
-                delete gameState.lastRollerId;
-                await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
-                
-                // Process the roll using the existing handler
-                await handleRollSubmitted(session, lastRoll, lastRollerId);
-            }
-        }
-    } catch (e) {
-        console.error(`${logPrefix} Error: ${e.message}`);
-    } finally {
-        if (client) client.release();
-        pollForSubmittedRolls.isRunning = false;
-    }
-}
-pollForSubmittedRolls.isRunning = false; // Initialize the flag
 // --- UTILITY FUNCTIONS ---
 function escape(text) { if (text === null || typeof text === 'undefined') return ''; return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');}
 async function getSolUsdPrice() { const cached = solPriceCache.get(SOL_PRICE_CACHE_KEY); if (cached && (Date.now() - cached.timestamp < SOL_USD_PRICE_CACHE_TTL_MS)) return cached.price; try { const price = parseFloat((await axios.get('https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT', { timeout: 8000 })).data?.price); solPriceCache.set(SOL_PRICE_CACHE_KEY, { price, timestamp: Date.now() }); return price; } catch (e) { try { const price = parseFloat((await axios.get('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd', { timeout: 8000 })).data?.solana?.usd); solPriceCache.set(SOL_PRICE_CACHE_KEY, { price, timestamp: Date.now() }); return parseFloat(price); } catch (e2) { if (cached) return cached.price; throw new Error("Could not retrieve SOL/USD price."); } }}
@@ -647,18 +579,71 @@ function getCleanGameNameHelper(gameType) {
 function getGameEmoji(gameType) { if (gameType.includes('bowling')) return '🎳'; if (gameType.includes('darts')) return '🎯'; if (gameType.includes('basketball')) return '🏀'; return '🎲'; }
 function formatRollsHelper(rolls) { if (!rolls || rolls.length === 0) return '...'; return rolls.map(r => `<b>${r}</b>`).join(' '); }
 
-// in helper_bot.js - REPLACEMENT for Main Execution block
+// --- Start of REPLACEMENT for the Main Execution block in helper_bot.js ---
+
+/**
+ * Connects a dedicated client to the database to listen for notifications
+ * from the main bot about new games and submitted rolls.
+ */
+async function setupHelperNotificationListener() {
+    console.log("⚙️ [Helper Listener] Setting up game session and roll listener...");
+    const listeningClient = await pool.connect();
+    
+    listeningClient.on('error', (err) => {
+        console.error('[Helper Listener] Dedicated client error:', err);
+        // Attempt to re-establish the listener after a delay
+        setTimeout(setupHelperNotificationListener, 5000);
+    });
+
+    listeningClient.on('notification', async (msg) => {
+        const logPrefix = `[Helper Listener NOTIFY Channel: ${msg.channel}]`;
+        try {
+            const payload = JSON.parse(msg.payload);
+            console.log(`${logPrefix} Received payload:`, payload);
+
+            // Notification for a new game session ready to be picked up
+            if (msg.channel === 'game_session_pickup' && payload.session?.main_bot_game_id) {
+                console.log(`${logPrefix} New game pickup notified for: ${payload.session.main_bot_game_id}.`);
+                const sessionRes = await pool.query("SELECT * FROM interactive_game_sessions WHERE main_bot_game_id = $1 AND status = 'pending_pickup'", [payload.session.main_bot_game_id]);
+                if (sessionRes.rowCount > 0) {
+                    await handleGameStart(sessionRes.rows[0]);
+                } else {
+                    console.warn(`${logPrefix} Received pickup for ${payload.session.main_bot_game_id}, but no 'pending_pickup' session found. Likely already processed.`);
+                }
+            } 
+            // Notification that a player has submitted a roll
+            else if (msg.channel === 'interactive_roll_submitted' && payload.session_id) {
+                 console.log(`${logPrefix} Roll submitted for session ID: ${payload.session_id}.`);
+                 const sessionRes = await pool.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [payload.session_id]);
+                 if (sessionRes.rowCount > 0) {
+                    const session = sessionRes.rows[0];
+                    const { lastRoll, lastRollerId } = session.game_state_json;
+                    
+                    if (lastRoll !== undefined && lastRollerId !== undefined) {
+                        // IMPORTANT: Clear the roll data to prevent re-processing
+                        const gameState = session.game_state_json;
+                        delete gameState.lastRoll;
+                        delete gameState.lastRollerId;
+                        await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
+                        
+                        await handleRollSubmitted(session, lastRoll, lastRollerId);
+                    }
+                 }
+            }
+
+        } catch (e) {
+            console.error(`${logPrefix} Error processing notification payload:`, e);
+        }
+    });
+
+    await listeningClient.query('LISTEN game_session_pickup');
+    await listeningClient.query('LISTEN interactive_roll_submitted');
+    console.log("✅ [Helper Listener] Now listening for 'game_session_pickup' and 'interactive_roll_submitted'.");
+}
 
 // --- Main Execution ---
-const ROLL_POLL_INTERVAL = 1500; // Check for rolls frequently
-const GAME_PICKUP_INTERVAL = 4000; // Check for new games every few seconds
+console.log('🚀 Helper Bot starting in Notification-Driven Mode...');
+setupHelperNotificationListener();
+console.log(`✅ Helper Bot is running and listening for real-time game events.`);
 
-console.log('🚀 Helper Bot starting in Polling-Only Mode...');
-
-// Poller 1: For picking up new games
-setInterval(processPendingGames, GAME_PICKUP_INTERVAL); 
-
-// Poller 2: For checking for new rolls in active games
-setInterval(pollForSubmittedRolls, ROLL_POLL_INTERVAL);
-
-console.log(`✅ Helper Bot is running. Game Pickup Interval: ${GAME_PICKUP_INTERVAL}ms, Roll Poll Interval: ${ROLL_POLL_INTERVAL}ms.`);
+// --- End of REPLACEMENT for the Main Execution block ---
