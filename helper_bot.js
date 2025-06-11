@@ -344,21 +344,39 @@ async function updateInteractivePvPGameBoard(sessionId) {
         if (client) client.release();
     }
 }
-// --- Start of REPLACEMENT for handleGameStart in helper_bot.js ---
+/**
+ * NEW, SIMPLIFIED: Processes a game session from a notification payload.
+ * It atomically claims the game and then immediately routes it to the correct logic.
+ */
+async function handleNewGameSession(sessionPayload) {
+    const mainBotGameId = sessionPayload.main_bot_game_id;
+    if (!mainBotGameId) return;
 
-async function handleGameStart(session) {
-    const logPrefix = `[HandleStart_V2 SID:${session.session_id}]`;
-    console.log(`${logPrefix} Initializing claimed game: ${session.game_type}`);
+    const logPrefix = `[HandleNewGame_V3 GID:${mainBotGameId}]`;
     let client = null;
     try {
         client = await pool.connect();
         await client.query('BEGIN');
-        
-        // The session status is already 'in_progress' from the listener's claim.
-        // We just need to set up the initial game state.
+
+        // Atomically claim the game and get its full, current data.
+        const claimQuery = `
+            UPDATE interactive_game_sessions 
+            SET status = 'in_progress', helper_bot_id = $1 
+            WHERE main_bot_game_id = $2 AND status = 'pending_pickup' 
+            RETURNING *`;
+        const claimRes = await client.query(claimQuery, [MY_BOT_ID, mainBotGameId]);
+
+        if (claimRes.rowCount === 0) {
+            console.warn(`${logPrefix} Could not claim game. It was likely processed by another instance.`);
+            await client.query('ROLLBACK');
+            return;
+        }
+
+        const session = claimRes.rows[0];
         const gameState = session.game_state_json || {};
         const gameType = session.game_type;
-        
+
+        // Initialize game state properties
         gameState.p1Name = gameState.initiatorName || "Player 1";
         gameState.currentPlayerTurn = String(gameState.initiatorId || session.user_id);
         if (gameType.includes('_pvp')) {
@@ -366,11 +384,11 @@ async function handleGameStart(session) {
             gameState.p1Rolls = []; gameState.p1Score = 0;
             gameState.p2Rolls = []; gameState.p2Score = 0;
         }
-        
+
         await client.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
         await client.query('COMMIT');
 
-        // --- Game Type Routing ---
+        // Now route the fully initialized and claimed session to the correct game logic
         if (gameType === 'darts_501') {
             await runDarts501Challenge(session);
         } else if (['bowling', 'basketball', 'darts'].includes(gameType)) {
@@ -381,15 +399,13 @@ async function handleGameStart(session) {
             console.error(`${logPrefix} Unknown game type to start: ${gameType}`);
             await finalizeGame(session, 'error');
         }
-    } catch (e) { 
-        if (client) await client.query('ROLLBACK'); 
-        console.error(`${logPrefix} Error initializing game: ${e.message}`); 
-    } finally { 
-        if (client) client.release(); 
+    } catch (e) {
+        if (client) await client.query('ROLLBACK');
+        console.error(`${logPrefix} Error initializing game: ${e.message}`);
+    } finally {
+        if (client) client.release();
     }
 }
-
-// --- End of REPLACEMENT for handleGameStart ---
 // in helper_bot.js - REPLACEMENT for advancePvPGameState
 async function advancePvPGameState(sessionId) {
     let client = null;
@@ -586,72 +602,47 @@ function formatRollsHelper(rolls) { if (!rolls || rolls.length === 0) return '..
 // --- Start of REPLACEMENT for setupHelperNotificationListener in helper_bot.js ---
 
 /**
- * Connects a dedicated client to the database to listen for notifications
- * and atomically claim new game sessions.
+ * Connects a dedicated client to the database to listen for notifications.
+ * This version is simplified to only call the new consolidated handler.
  */
 async function setupHelperNotificationListener() {
-    console.log("⚙️ [Helper Listener V2] Setting up atomic game session and roll listener...");
+    console.log("⚙️ [Helper Listener V3] Setting up simplified game event listener...");
     const listeningClient = await pool.connect();
     
     listeningClient.on('error', (err) => {
-        console.error('[Helper Listener V2] Dedicated client error:', err);
-        setTimeout(setupHelperNotificationListener, 5000); // Attempt to reconnect
+        console.error('[Helper Listener V3] Dedicated client error:', err);
+        setTimeout(setupHelperNotificationListener, 5000);
     });
 
     listeningClient.on('notification', async (msg) => {
-        const logPrefix = `[Helper Listener V2 NOTIFY Channel: ${msg.channel}]`;
         try {
             const payload = JSON.parse(msg.payload);
 
-            // --- ATOMICALLY CLAIM a new game session ---
-            if (msg.channel === 'game_session_pickup' && payload.session?.main_bot_game_id) {
-                console.log(`${logPrefix} New game pickup notified for: ${payload.session.main_bot_game_id}. Attempting to claim...`);
-                
-                // This is the atomic "claim" operation. It finds a pending session and immediately
-                // updates its status in one command, returning the game data only if it was successful.
-                const claimQuery = `
-                    UPDATE interactive_game_sessions 
-                    SET status = 'in_progress', helper_bot_id = $1 
-                    WHERE main_bot_game_id = $2 AND status = 'pending_pickup' 
-                    RETURNING *`;
-                
-                const claimRes = await pool.query(claimQuery, [MY_BOT_ID, payload.session.main_bot_game_id]);
-
-                if (claimRes.rowCount > 0) {
-                    // Success! We claimed the game.
-                    console.log(`${logPrefix} Successfully claimed session for game ${payload.session.main_bot_game_id}.`);
-                    await handleGameStart(claimRes.rows[0]);
-                } else {
-                    // No rows affected means another process (like the old poller) got it first.
-                    console.warn(`${logPrefix} Could not claim game ${payload.session.main_bot_game_id}. It was likely processed by another instance or poller.`);
-                }
+            if (msg.channel === 'game_session_pickup' && payload.session) {
+                await handleNewGameSession(payload.session);
             } 
-            // --- Roll submission logic remains the same ---
             else if (msg.channel === 'interactive_roll_submitted' && payload.session_id) {
                  const sessionRes = await pool.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [payload.session_id]);
                  if (sessionRes.rowCount > 0) {
                     const session = sessionRes.rows[0];
                     const { lastRoll, lastRollerId } = session.game_state_json;
-                    
                     if (lastRoll !== undefined && lastRollerId !== undefined) {
                         const gameState = session.game_state_json;
                         delete gameState.lastRoll;
                         delete gameState.lastRollerId;
                         await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
-                        
                         await handleRollSubmitted(session, lastRoll, lastRollerId);
                     }
                  }
             }
-
         } catch (e) {
-            console.error(`${logPrefix} Error processing notification payload:`, e);
+            console.error(`[Helper Listener V3] Error processing notification:`, e);
         }
     });
 
     await listeningClient.query('LISTEN game_session_pickup');
     await listeningClient.query('LISTEN interactive_roll_submitted');
-    console.log("✅ [Helper Listener V2] Now listening for real-time game events.");
+    console.log("✅ [Helper Listener V3] Now listening for real-time game events.");
 }
 
 // --- End of REPLACEMENT for setupHelperNotificationListener ---
