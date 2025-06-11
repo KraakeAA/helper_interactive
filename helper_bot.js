@@ -543,6 +543,62 @@ async function handleGameTimeout(sessionId) {
     if (res.rowCount > 0 && res.rows[0].status === 'in_progress') { await finalizeGame(res.rows[0], 'completed_timeout'); }
 }
 
+// --- START OF MISSING FUNCTION DEFINITION ---
+// Add this entire block to your helper_bot.js file, for example, before the "UTILITY FUNCTIONS" section.
+
+/**
+ * Connects a dedicated client to the database to listen for notifications.
+ * This is the core of the event-driven system for the helper bot.
+ */
+async function setupHelperNotificationListener() {
+    console.log("⚙️ [Helper Listener] Setting up game session and roll listener...");
+    const listeningClient = await pool.connect();
+    
+    listeningClient.on('error', (err) => {
+        console.error('[Helper Listener] Dedicated client error:', err);
+        // Attempt to re-establish the listener after a delay
+        setTimeout(setupHelperNotificationListener, 5000);
+    });
+
+    listeningClient.on('notification', async (msg) => {
+        const logPrefix = `[Helper Listener NOTIFY Channel: ${msg.channel}]`;
+        try {
+            const payload = JSON.parse(msg.payload);
+
+            // Notification for a new game session ready to be picked up
+            if (msg.channel === 'game_session_pickup' && payload.session?.main_bot_game_id) {
+                await handleNewGameSession(payload.session);
+            } 
+            // Notification that a player has submitted a roll
+            else if (msg.channel === 'interactive_roll_submitted' && payload.session_id) {
+                 const sessionRes = await pool.query("SELECT * FROM interactive_game_sessions WHERE session_id = $1", [payload.session_id]);
+                 if (sessionRes.rowCount > 0) {
+                    const session = sessionRes.rows[0];
+                    const { lastRoll, lastRollerId } = session.game_state_json;
+                    
+                    if (lastRoll !== undefined && lastRollerId !== undefined) {
+                        // IMPORTANT: Clear the roll data to prevent re-processing
+                        const gameState = session.game_state_json;
+                        delete gameState.lastRoll;
+                        delete gameState.lastRollerId;
+                        await pool.query("UPDATE interactive_game_sessions SET game_state_json = $1 WHERE session_id = $2", [JSON.stringify(gameState), session.session_id]);
+                        
+                        await handleRollSubmitted(session, lastRoll, lastRollerId);
+                    }
+                 }
+            }
+
+        } catch (e) {
+            console.error(`${logPrefix} Error processing notification payload:`, e);
+        }
+    });
+
+    await listeningClient.query('LISTEN game_session_pickup');
+    await listeningClient.query('LISTEN interactive_roll_submitted');
+    console.log("✅ [Helper Listener] Now listening for real-time game events.");
+}
+
+// --- END OF MISSING FUNCTION DEFINITION ---
 
 // --- UTILITY FUNCTIONS ---
 function escape(text) { if (text === null || typeof text === 'undefined') return ''; return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#039;');}
