@@ -655,3 +655,7 @@ async function setupHelperNotificationListener() {
 }
 
 // --- End of REPLACEMENT for setupHelperNotificationListener ---
+// --- Main Execution ---
+console.log('🚀 Helper Bot starting in Notification-Driven Mode...');
+setupHelperNotificationListener();
+console.log(`✅ Helper Bot is running and listening for real-time game events.`);
