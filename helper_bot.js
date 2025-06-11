@@ -49,7 +49,7 @@ const PVB_BOWLING_SCORES = { 6: 10, 5: 8, 4: 6, 3: 4, 2: 2, 1: 0 };
 
 // PvP Constants
 const PVP_BOWLING_FRAMES = 3;
-const PVP_BASKETBALL_SHOTS = 5;
+const PVP_BASKETBALL_SHOTS = 3;
 const PVP_DARTS_THROWS = 3;
 
 
